@@ -58,6 +58,10 @@ static int param_bus_num = -1;
 module_param_named(spi_bus_num, param_bus_num, int, 0600);
 MODULE_PARM_DESC(spi_bus_num, "SPI controller bus number (if negative, dynamic allocation)");
 
+static int channel_mask = 0x0F; /* Default: all 4 channels enabled (0x01 | 0x02 | 0x04 | 0x08) */
+module_param(channel_mask, int, S_IRUGO);
+MODULE_PARM_DESC(channel_mask, "Bitmask of channels to enable SPI (1=A, 2=B, 4=C, 8=D)");
+
 /*
  * Performance tuning knobs – defaults keep legacy behaviour but allow
  * opt-in batching/latency trade-offs when explicitly configured.
@@ -1893,6 +1897,22 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 	}
 	
 	dev_info(dev, "spi_master: bus_num=%d\n", master->bus_num);
+
+	struct spi_board_info spidev_info = {
+           .modalias = "spidev",
+           .max_speed_hz = 30000000,
+           .bus_num = master->bus_num,
+           .chip_select = 0,
+           .mode = SPI_MODE_0,
+	};
+
+	if (!spi_new_device(master, &spidev_info)) {
+		dev_err(&pdev->dev, "Failed to create spidev child\n");
+	}
+	else
+	{
+		dev_info(&pdev->dev, "Created spidev child\n");
+	}
 
 	ret = priv->iops->set_bitmode(priv->intf, 0x00, BITMODE_MPSSE);
 	if (ret < 0) {
