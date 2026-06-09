@@ -1577,7 +1577,7 @@ static int ftdi_spi_transfer_one(struct spi_controller *ctlr,
 		return 0;
 
 	if (priv->last_speed_hz != xfer->speed_hz) {
-		dev_dbg(dev, "%s: new speed %u\n", __func__, (int)xfer->speed_hz);
+		dev_info(dev, "%s: new speed %u\n", __func__, (int)xfer->speed_hz);
 		ret = priv->iops->set_clock(priv->intf, xfer->speed_hz);
 		if (ret < 0) {
 			dev_err(dev, "Set clock(%u) failed: %d\n", xfer->speed_hz, ret);
@@ -2329,12 +2329,15 @@ static int ftdi_mpsse_get_port_pins(struct ft232h_intf_priv *priv, bool low)
 
 	rxbuf[0] = 0;
 	do {
-		usleep_range(5000, 5200);
 		ret = ftdi_read_data(priv->intf, rxbuf, 1);
 		tout--;
 		if (!tout) {
 			dev_err(dev, "Timeout when getting port pins\n");
 			return -ETIMEDOUT;
+		}
+		if(ret == 0)
+		{
+		  usleep_range(100, 120);
 		}
 	} while (ret == 0);
 
@@ -2672,7 +2675,7 @@ static int ft232h_intf_spi_probe(struct usb_interface *intf,
 	irq_tag = "IRQ";
 #endif
 
-	dev_info(dev, "%s %s %s\n", __func__, VERSION, irq_tag);
+	dev_info(dev, "%s %s %s, poll=%u\n", __func__, VERSION, irq_tag, irq_poll_period);
 
 	pdev = mpsse_dev_register(priv, plat_data);
 	if (IS_ERR(pdev)) {
@@ -2808,7 +2811,7 @@ static int ftdi_mpsse_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	}
 	mutex_unlock(&priv->io_mutex);
 
-	dev_dbg(chip->parent, "%s: offset %d\n", __func__, offset);
+	dev_dbg_ratelimited(chip->parent, "%s: offset %d\n", __func__, offset);
 
 	low = offset < 4;
 	bit = low ? offset + 4 : offset - 4;
@@ -2972,7 +2975,7 @@ static void mpsse_irq_enable_disable(struct irq_data *data, bool enable)
 	if (irq < 0 || irq >= chip->ngpio)
 		return;
 
-	dev_info(&priv->intf->dev, "%s: irq %d, type %d, enable %d\n", __func__, irq, priv->irq_type[irq], enable);
+	dev_dbg(&priv->intf->dev, "%s: irq %d, type %d, enable %d\n", __func__, irq, priv->irq_type[irq], enable);
 
 	priv->irq_enabled[irq] = enable;
 }
@@ -3051,13 +3054,14 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 
 		gpio_val = ftdi_mpsse_gpio_get(chip, offset);
 
+		changed = false;
 		if(gpio_val != priv->irq_last_value[offset])
 		{
 			priv->irq_last_value[offset] = gpio_val;
 			changed = true;
 		}
 
-		dev_info(&priv->intf->dev, "check irq: offset %d, val %d, changed %d\n",
+		dev_dbg_ratelimited(&priv->intf->dev, "check irq: offset %d, val %d, changed %d\n",
 			offset, gpio_val, changed);
 
 		switch (priv->irq_type[offset])
@@ -3082,12 +3086,12 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 		}
 
 		if (!gpio_val) {
-			dev_info(&priv->intf->dev, "irq low: offset %d, val %d\n",
+			dev_dbg_ratelimited(&priv->intf->dev, "irq low: offset %d, val %d\n",
 				offset, gpio_val);
 			ftdi_mpsse_dispatch_irq(priv, offset);
 		}
 		if (gpio_val) {
-			dev_info(&priv->intf->dev, "irq high: offset %d, val %d\n",
+			dev_dbg_ratelimited(&priv->intf->dev, "irq high: offset %d, val %d\n",
 				offset, gpio_val);
 			ftdi_mpsse_dispatch_irq(priv, offset);
 		}

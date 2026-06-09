@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: GPL-2.0
+# Build the spi-ft232h out-of-tree kernel module for:
+#   - Ubuntu x86_64 (native)
+#   - Ubuntu ARM64  (native, GitHub ARM runner)
+#   - Raspberry Pi arm64 / armhf (cross-compile against RPi kernel)
+
+name: Build Driver
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------
+  # Native builds: x86_64 and ARM64 Ubuntu against linux-headers-generic
+  # ---------------------------------------------------------------
+  native:
+    name: Ubuntu ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential linux-headers-generic
+
+      - name: Build module
+        run: make KDIR=/usr/src/linux-headers-$(ls /usr/src | grep generic | tail -1)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spi-ft232h-ubuntu-${{ matrix.arch }}
+          path: |
+            spi-ft232h.ko
+            spi-ft232h.ko.zst
+
+  # ---------------------------------------------------------------
+  # Cross-compile for Raspberry Pi against the official RPi kernel
+  # ---------------------------------------------------------------
+  rpi-cross:
+    name: Raspberry Pi ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            cross_compile: aarch64-linux-gnu-
+            cross_pkg: gcc-aarch64-linux-gnu
+            defconfig: bcm2711_defconfig
+            artifact: rpi-arm64
+
+          - arch: arm
+            cross_compile: arm-linux-gnueabihf-
+            cross_pkg: gcc-arm-linux-gnueabihf
+            defconfig: bcm2709_defconfig
+            artifact: rpi-armhf
+
+    env:
+      RPI_LINUX: ${{ github.workspace }}/../rpi-linux
+      ARCH: ${{ matrix.arch }}
+      CROSS_COMPILE: ${{ matrix.cross_compile }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc flex bison libssl-dev libelf-dev \
+            ${{ matrix.cross_pkg }}
+
+      - name: Cache Raspberry Pi kernel source
+        id: rpi-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RPI_LINUX }}
+          key: rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-${{ hashFiles('spi-ft232h.c') }}
+          restore-keys: |
+            rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-
+            rpi-linux-${{ matrix.arch }}-
+
+      - name: Clone Raspberry Pi kernel (shallow)
+        if: steps.rpi-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch rpi-6.6.y \
+            https://github.com/raspberrypi/linux.git "$RPI_LINUX"
+
+      - name: Prepare kernel build system
+        run: |
+          make -C "$RPI_LINUX" \
+            ARCH=${{ matrix.arch }} \
+            CROSS_COMPILE=${{ matrix.cross_compile }} \
+            ${{ matrix.defconfig }}
+          make -C "$RPI_LINUX" \
+            ARCH=${{ matrix.arch }} \
+            CROSS_COMPILE=${{ matrix.cross_compile }} \
+            modules_prepare
+
+      - name: Build module
+        run: |
+          make \
+            ARCH=${{ matrix.arch }} \
+            CROSS_COMPILE=${{ matrix.cross_compile }} \
+            KDIR="$RPI_LINUX"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spi-ft232h-${{ matrix.artifact }}
+          path: |
+            spi-ft232h.ko
+            spi-ft232h.ko.zst
