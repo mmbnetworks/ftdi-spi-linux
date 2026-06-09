@@ -157,6 +157,8 @@ MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in ms (default 5 ms)");
 #define spi_controller spi_master
 #endif
 
+#define MPSSE_GPIO_MASK 0x0F
+
 /* Device info struct used for device specific init. */
 struct ft232h_intf_info {
 	int (*probe)(struct usb_interface *intf, const void *plat_data);
@@ -362,12 +364,12 @@ static void ftdi_spi_set_cs(struct spi_device *spi, bool enable)
 {
 	struct ftdi_spi *priv = spi_controller_get_devdata(spi->controller);
 	unsigned int cs_idx = ftdi_spi_chip_select(spi);
-	unsigned int cs = __ffs(MPSSE_CS);
+	unsigned int cs = 0;
 	bool level;
 
 	if (cs_idx)
 		dev_warn_once(&priv->pdev->dev,
-			      "chip-select index %u unsupported, using CS on AD3\n",
+			      "chip-select index %u unsupported, using internal CS offset 0 (AD3)\n",
 			      cs_idx);
 
 	/*
@@ -1660,6 +1662,7 @@ static int ftdi_spi_transfer_one(struct spi_controller *ctlr,
 	ftdi_spi_maybe_retune(priv);
 
 	spi_finalize_current_transfer(ctlr);
+
 	return ret;
 }
 
@@ -2341,13 +2344,21 @@ static int ftdi_mpsse_get_port_pins(struct ft232h_intf_priv *priv, bool low)
 	if (ret != 1)
 		return -EINVAL;
 
-	if (low)
-		priv->gpiol_mask = rxbuf[0];
-	else
+	if (low) {
+		/*
+		 * Only update GPIO bits (AD4-AD7), preserving SPI bits (AD0-AD3).
+		 * SPI pins (SK, DO, DI, CS on bits 0-3) must be controlled only
+		 * through explicit driver writes, not by polling reads.
+		 */
+		priv->gpiol_mask = (priv->gpiol_mask & MPSSE_GPIO_MASK) |
+				   (rxbuf[0] & ~MPSSE_GPIO_MASK);
+	} else {
 		priv->gpioh_mask = rxbuf[0];
+	}
 
 	return 0;
 }
+
 
 static int ftdi_mpsse_set_port_pins(struct ft232h_intf_priv *priv, bool low)
 {
@@ -2396,8 +2407,6 @@ static int ftdi_mpsse_init_pins(struct usb_interface *intf, bool low,
 	return ret;
 }
 
-#define MPSSE_GPIO_MASK 0x0F
-
 static int ftdi_mpsse_cfg_bus_pins(struct usb_interface *intf,
 				   u8 dir_bits, u8 value_bits)
 {
@@ -2435,7 +2444,12 @@ int ftdi_gpio_get(struct usb_interface *intf, unsigned int offset)
 
 	dev_dbg(dev, "%s: offset %d\n", __func__, offset);
 
-	low = offset < 8;
+	/*
+	 * Private FTDI interface offsets keep SPI CS at offset 0 by mapping
+	 * low-port offsets 0..4 to AD3..AD7. Public gpiochip numbering is handled
+	 * separately in the gpiolib callbacks.
+	 */
+	low = offset < 5;
 
 	mutex_lock(&priv->ops_mutex);
 
@@ -2446,9 +2460,9 @@ int ftdi_gpio_get(struct usb_interface *intf, unsigned int offset)
 	}
 
 	if (low)
-		val = priv->gpiol_mask & BIT(offset);
+		val = priv->gpiol_mask & (BIT(offset) << 3);
 	else
-		val = priv->gpioh_mask & BIT(offset - 8);
+		val = priv->gpioh_mask & BIT(offset - 5);
 
 	mutex_unlock(&priv->ops_mutex);
 
@@ -2473,18 +2487,18 @@ void ftdi_gpio_set(struct usb_interface *intf, unsigned int offset, int value)
 
 	mutex_lock(&priv->ops_mutex);
 
-	if (offset < 8) {
+	if (offset < 5) {
 		low = true;
 		if (value)
-			priv->gpiol_mask |= BIT(offset);
+			priv->gpiol_mask |= BIT(offset) << 3;
 		else
-			priv->gpiol_mask &= ~BIT(offset);
+			priv->gpiol_mask &= ~(BIT(offset) << 3);
 	} else {
 		low = false;
 		if (value)
-			priv->gpioh_mask |= BIT(offset - 8);
+			priv->gpioh_mask |= BIT(offset - 5);
 		else
-			priv->gpioh_mask &= ~BIT(offset - 8);
+			priv->gpioh_mask &= ~BIT(offset - 5);
 	}
 
 	ftdi_mpsse_set_port_pins(priv, low);
@@ -2510,12 +2524,12 @@ int ftdi_gpio_direction_input(struct usb_interface *intf, unsigned int offset)
 
 	mutex_lock(&priv->ops_mutex);
 
-	if (offset < 8) {
+	if (offset < 5) {
 		low = true;
-		priv->gpiol_dir &= ~BIT(offset);
+		priv->gpiol_dir &= ~(BIT(offset) << 3);
 	} else {
 		low = false;
-		priv->gpioh_dir &= ~BIT(offset - 8);
+		priv->gpioh_dir &= ~BIT(offset - 5);
 	}
 
 	ret = ftdi_mpsse_set_port_pins(priv, low);
@@ -2544,22 +2558,22 @@ int ftdi_gpio_direction_output(struct usb_interface *intf, unsigned int offset, 
 
 	mutex_lock(&priv->ops_mutex);
 
-	if (offset < 8) {
+	if (offset < 5) {
 		low = true;
-		priv->gpiol_dir |= BIT(offset);
+		priv->gpiol_dir |= BIT(offset) << 3;
 
 		if (value)
-			priv->gpiol_mask |= BIT(offset);
+			priv->gpiol_mask |= BIT(offset) << 3;
 		else
-			priv->gpiol_mask &= ~BIT(offset);
+			priv->gpiol_mask &= ~(BIT(offset) << 3);
 	} else {
 		low = false;
-		priv->gpioh_dir |= BIT(offset - 8);
+		priv->gpioh_dir |= BIT(offset - 5);
 
 		if (value)
-			priv->gpioh_mask |= BIT(offset - 8);
+			priv->gpioh_mask |= BIT(offset - 5);
 		else
-			priv->gpioh_mask &= ~BIT(offset - 8);
+			priv->gpioh_mask &= ~BIT(offset - 5);
 	}
 
 	ret = ftdi_mpsse_set_port_pins(priv, low);
@@ -3030,7 +3044,6 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 	unsigned int offset = chip->ngpio;
 	int gpio_val = 0;
 	bool changed = false;
-
 	while(offset--)
 	{
 		if(!priv->irq_enabled[offset])
@@ -3188,8 +3201,8 @@ static int ftdi_mpsse_gpio_probe(struct usb_interface *intf)
 	chip->parent = parent;
 	chip->owner = THIS_MODULE;
 	chip->base = (param_gpio_base >= 0) ? param_gpio_base : -1;
-	/* Expose only non-SPI GPIOs: AD4-AD7 and AC0-AC3. */
-	chip->ngpio = FTDI_MPSSE_GPIOS - 4;
+	/* Expose all non-SPI GPIOs: AD4-AD7 and AC0-AC7. */
+	chip->ngpio = FTDI_MPSSE_GPIOS;
 	chip->can_sleep = true;
 	chip->set = ftdi_mpsse_gpio_set;
 	chip->get = ftdi_mpsse_gpio_get;
