@@ -2780,7 +2780,7 @@ static int ftdi_mpsse_gpio_get(struct gpio_chip *chip, unsigned int offset)
 
 	dev_dbg(chip->parent, "%s: offset %d\n", __func__, offset);
 
-	low = offset < 5;
+	low = offset < 4;
 
 	mutex_lock(&priv->ops_mutex);
 
@@ -2791,9 +2791,9 @@ static int ftdi_mpsse_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	}
 
 	if (low)
-		val = priv->gpiol_mask & (BIT(offset) << 3);
+		val = priv->gpiol_mask & (BIT(offset) << 4);
 	else
-		val = priv->gpioh_mask & BIT(offset - 5);
+		val = priv->gpioh_mask & BIT(offset - 4);
 
 	mutex_unlock(&priv->ops_mutex);
 
@@ -2932,6 +2932,8 @@ static void mpsse_irq_enable_disable(struct irq_data *data, bool enable)
 	if (irq < 0 || irq >= chip->ngpio)
 		return;
 
+	dev_info(&priv->intf->dev, "%s: irq %d, enable %d\n", __func__, irq, enable);
+
 	priv->irq_enabled[irq] = enable;
 }
 
@@ -2981,6 +2983,21 @@ static int ftdi_mpsse_gpio_to_irq(struct gpio_chip *chip,
 }
 
 #ifdef CONFIG_GPIOLIB_IRQCHIP
+static void ftdi_mpsse_dispatch_irq(struct ft232h_intf_priv *priv,
+					    unsigned int offset)
+{
+	unsigned long flags;
+
+	/*
+	 * generic_handle_irq() expects hardirq-like context. This driver
+	 * dispatches from a kthread, so force local IRQs off while invoking
+	 * the nested handler to satisfy IRQ core expectations.
+	 */
+	local_irq_save(flags);
+	generic_handle_irq(priv->irq_base + offset);
+	local_irq_restore(flags);
+}
+
 static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 {
 	struct gpio_chip *chip = &priv->mpsse_gpio;
@@ -2992,15 +3009,19 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 		if(!priv->irq_enabled[offset])
 			continue;
 
-		gpio_val = ftdi_gpio_get(priv->intf, offset);
+		gpio_val = ftdi_mpsse_gpio_get(chip, offset);
+
+		dev_info(&priv->intf->dev, "%s: offset %d, val %d\n",
+			__func__, offset, gpio_val);
 
 		if (!gpio_val &&
 		    (priv->irq_type[offset] == IRQ_TYPE_EDGE_FALLING ||
 		     priv->irq_type[offset] == IRQ_TYPE_LEVEL_LOW)) {
-			generic_handle_irq(priv->irq_base + offset);
+
+			ftdi_mpsse_dispatch_irq(priv, offset);
 		}
 		else if (gpio_val) {
-			generic_handle_irq(priv->irq_base + offset);
+			ftdi_mpsse_dispatch_irq(priv, offset);
 		}
 	}
 }
