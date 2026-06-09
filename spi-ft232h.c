@@ -193,8 +193,10 @@ struct ft232h_intf_priv {
 
 	struct irq_chip		mpsse_irq;
 	int			irq_base;
-	bool              	irq_enabled[FTDI_MPSSE_GPIOS];
+	bool		irq_enabled[FTDI_MPSSE_GPIOS];
 	int			irq_type[FTDI_MPSSE_GPIOS];
+	int			irq_last_value[FTDI_MPSSE_GPIOS];
+	bool		irq_last_value_valid[FTDI_MPSSE_GPIOS];
 };
 
 /* Cumulative transfer counters exported through debugfs for benchmarking. */
@@ -359,9 +361,22 @@ static inline unsigned int ftdi_spi_chip_select(struct spi_device *spi)
 static void ftdi_spi_set_cs(struct spi_device *spi, bool enable)
 {
 	struct ftdi_spi *priv = spi_controller_get_devdata(spi->controller);
-	unsigned int cs = ftdi_spi_chip_select(spi);
+	unsigned int cs_idx = ftdi_spi_chip_select(spi);
+	unsigned int cs = __ffs(MPSSE_CS);
+	bool level;
 
-	priv->iops->gpio_set(priv->intf, cs, enable);
+	if (cs_idx)
+		dev_warn_once(&priv->pdev->dev,
+			      "chip-select index %u unsupported, using CS on AD3\n",
+			      cs_idx);
+
+	/*
+	 * SPI core passes assert/deassert intent. Convert that to electrical level
+	 * according to chip-select polarity before driving the pin.
+	 */
+	level = (spi->mode & SPI_CS_HIGH) ? !enable : enable;
+
+	priv->iops->gpio_set(priv->intf, cs, level);
 }
 
 static inline u8 ftdi_spi_txrx_byte_cmd(struct spi_device *spi)
@@ -2420,7 +2435,7 @@ int ftdi_gpio_get(struct usb_interface *intf, unsigned int offset)
 
 	dev_dbg(dev, "%s: offset %d\n", __func__, offset);
 
-	low = offset < 5;
+	low = offset < 8;
 
 	mutex_lock(&priv->ops_mutex);
 
@@ -2431,9 +2446,9 @@ int ftdi_gpio_get(struct usb_interface *intf, unsigned int offset)
 	}
 
 	if (low)
-		val = priv->gpiol_mask & (BIT(offset) << 3);
+		val = priv->gpiol_mask & BIT(offset);
 	else
-		val = priv->gpioh_mask & BIT(offset - 5);
+		val = priv->gpioh_mask & BIT(offset - 8);
 
 	mutex_unlock(&priv->ops_mutex);
 
@@ -2458,18 +2473,18 @@ void ftdi_gpio_set(struct usb_interface *intf, unsigned int offset, int value)
 
 	mutex_lock(&priv->ops_mutex);
 
-	if (offset < 5) {
+	if (offset < 8) {
 		low = true;
 		if (value)
-			priv->gpiol_mask |= (BIT(offset) << 3);
+			priv->gpiol_mask |= BIT(offset);
 		else
-			priv->gpiol_mask &= ~(BIT(offset) << 3);
+			priv->gpiol_mask &= ~BIT(offset);
 	} else {
 		low = false;
 		if (value)
-			priv->gpioh_mask |= BIT(offset - 5);
+			priv->gpioh_mask |= BIT(offset - 8);
 		else
-			priv->gpioh_mask &= ~BIT(offset - 5);
+			priv->gpioh_mask &= ~BIT(offset - 8);
 	}
 
 	ftdi_mpsse_set_port_pins(priv, low);
@@ -2495,12 +2510,12 @@ int ftdi_gpio_direction_input(struct usb_interface *intf, unsigned int offset)
 
 	mutex_lock(&priv->ops_mutex);
 
-	if (offset < 5) {
+	if (offset < 8) {
 		low = true;
-		priv->gpiol_dir &= ~(BIT(offset) << 3);
+		priv->gpiol_dir &= ~BIT(offset);
 	} else {
 		low = false;
-		priv->gpioh_dir &= ~BIT(offset - 5);
+		priv->gpioh_dir &= ~BIT(offset - 8);
 	}
 
 	ret = ftdi_mpsse_set_port_pins(priv, low);
@@ -2529,22 +2544,22 @@ int ftdi_gpio_direction_output(struct usb_interface *intf, unsigned int offset, 
 
 	mutex_lock(&priv->ops_mutex);
 
-	if (offset < 5) {
+	if (offset < 8) {
 		low = true;
-		priv->gpiol_dir |= BIT(offset) << 3;
+		priv->gpiol_dir |= BIT(offset);
 
 		if (value)
-			priv->gpiol_mask |= BIT(offset) << 3;
+			priv->gpiol_mask |= BIT(offset);
 		else
-			priv->gpiol_mask &= ~(BIT(offset) << 3);
+			priv->gpiol_mask &= ~BIT(offset);
 	} else {
 		low = false;
-		priv->gpioh_dir |= BIT(offset - 5);
+		priv->gpioh_dir |= BIT(offset - 8);
 
 		if (value)
-			priv->gpioh_mask |= BIT(offset - 5);
+			priv->gpioh_mask |= BIT(offset - 8);
 		else
-			priv->gpioh_mask &= ~BIT(offset - 5);
+			priv->gpioh_mask &= ~BIT(offset - 8);
 	}
 
 	ret = ftdi_mpsse_set_port_pins(priv, low);
@@ -2770,6 +2785,7 @@ static int ftdi_mpsse_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	struct ft232h_intf_priv *priv = gpiochip_get_data(chip);
 	int ret, val;
 	bool low;
+	unsigned int bit;
 
 	mutex_lock(&priv->io_mutex);
 	if (!priv->intf) {
@@ -2781,6 +2797,7 @@ static int ftdi_mpsse_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	dev_dbg(chip->parent, "%s: offset %d\n", __func__, offset);
 
 	low = offset < 4;
+	bit = low ? offset + 4 : offset - 4;
 
 	mutex_lock(&priv->ops_mutex);
 
@@ -2791,9 +2808,9 @@ static int ftdi_mpsse_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	}
 
 	if (low)
-		val = priv->gpiol_mask & (BIT(offset) << 4);
+		val = priv->gpiol_mask & BIT(bit);
 	else
-		val = priv->gpioh_mask & BIT(offset - 4);
+		val = priv->gpioh_mask & BIT(bit);
 
 	mutex_unlock(&priv->ops_mutex);
 
@@ -2805,6 +2822,7 @@ static void ftdi_mpsse_gpio_set(struct gpio_chip *chip, unsigned int offset,
 {
 	struct ft232h_intf_priv *priv = gpiochip_get_data(chip);
 	bool low;
+	unsigned int bit;
 
 	mutex_lock(&priv->io_mutex);
 	if (!priv->intf) {
@@ -2820,16 +2838,18 @@ static void ftdi_mpsse_gpio_set(struct gpio_chip *chip, unsigned int offset,
 
 	if (offset < 4) {
 		low = true;
+		bit = offset + 4;
 		if (value)
-			priv->gpiol_mask |= (BIT(offset) << 4);
+			priv->gpiol_mask |= BIT(bit);
 		else
-			priv->gpiol_mask &= ~(BIT(offset) << 4);
+			priv->gpiol_mask &= ~BIT(bit);
 	} else {
 		low = false;
+		bit = offset - 4;
 		if (value)
-			priv->gpioh_mask |= BIT(offset - 4);
+			priv->gpioh_mask |= BIT(bit);
 		else
-			priv->gpioh_mask &= ~BIT(offset - 4);
+			priv->gpioh_mask &= ~BIT(bit);
 	}
 
 	ftdi_mpsse_set_port_pins(priv, low);
@@ -2843,6 +2863,7 @@ static int ftdi_mpsse_gpio_direction_input(struct gpio_chip *chip,
 	struct ft232h_intf_priv *priv = gpiochip_get_data(chip);
 	bool low;
 	int ret;
+	unsigned int bit;
 
 	mutex_lock(&priv->io_mutex);
 	if (!priv->intf) {
@@ -2857,10 +2878,12 @@ static int ftdi_mpsse_gpio_direction_input(struct gpio_chip *chip,
 
 	if (offset < 4) {
 		low = true;
-		priv->gpiol_dir &= ~(BIT(offset) << 4);
+		bit = offset + 4;
+		priv->gpiol_dir &= ~BIT(bit);
 	} else {
 		low = false;
-		priv->gpioh_dir &= ~BIT(offset - 4);
+		bit = offset - 4;
+		priv->gpioh_dir &= ~BIT(bit);
 	}
 
 	ret = ftdi_mpsse_set_port_pins(priv, low);
@@ -2876,6 +2899,7 @@ static int ftdi_mpsse_gpio_direction_output(struct gpio_chip *chip,
 	struct ft232h_intf_priv *priv = gpiochip_get_data(chip);
 	bool low;
 	int ret;
+	unsigned int bit;
 
 	mutex_lock(&priv->io_mutex);
 	if (!priv->intf) {
@@ -2891,20 +2915,22 @@ static int ftdi_mpsse_gpio_direction_output(struct gpio_chip *chip,
 
 	if (offset < 4) {
 		low = true;
-		priv->gpiol_dir |= BIT(offset) << 4;
+		bit = offset + 4;
+		priv->gpiol_dir |= BIT(bit);
 
 		if (value)
-			priv->gpiol_mask |= BIT(offset) << 4;
+			priv->gpiol_mask |= BIT(bit);
 		else
-			priv->gpiol_mask &= ~(BIT(offset) << 4);
+			priv->gpiol_mask &= ~BIT(bit);
 	} else {
 		low = false;
-		priv->gpioh_dir |= BIT(offset - 4);
+		bit = offset - 4;
+		priv->gpioh_dir |= BIT(bit);
 
 		if (value)
-			priv->gpioh_mask |= BIT(offset - 4);
+			priv->gpioh_mask |= BIT(bit);
 		else
-			priv->gpioh_mask &= ~BIT(offset - 4);
+			priv->gpioh_mask &= ~BIT(bit);
 	}
 
 	ret = ftdi_mpsse_set_port_pins(priv, low);
@@ -2932,7 +2958,7 @@ static void mpsse_irq_enable_disable(struct irq_data *data, bool enable)
 	if (irq < 0 || irq >= chip->ngpio)
 		return;
 
-	dev_info(&priv->intf->dev, "%s: irq %d, enable %d\n", __func__, irq, enable);
+	dev_info(&priv->intf->dev, "%s: irq %d, type %d, enable %d\n", __func__, irq, priv->irq_type[irq], enable);
 
 	priv->irq_enabled[irq] = enable;
 }
@@ -3003,6 +3029,7 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 	struct gpio_chip *chip = &priv->mpsse_gpio;
 	unsigned int offset = chip->ngpio;
 	int gpio_val = 0;
+	bool changed = false;
 
 	while(offset--)
 	{
@@ -3011,16 +3038,44 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 
 		gpio_val = ftdi_mpsse_gpio_get(chip, offset);
 
-		dev_info(&priv->intf->dev, "%s: offset %d, val %d\n",
-			__func__, offset, gpio_val);
+		if(gpio_val != priv->irq_last_value[offset])
+		{
+			priv->irq_last_value[offset] = gpio_val;
+			changed = true;
+		}
 
-		if (!gpio_val &&
-		    (priv->irq_type[offset] == IRQ_TYPE_EDGE_FALLING ||
-		     priv->irq_type[offset] == IRQ_TYPE_LEVEL_LOW)) {
+		dev_info(&priv->intf->dev, "check irq: offset %d, val %d, changed %d\n",
+			offset, gpio_val, changed);
 
+		switch (priv->irq_type[offset])
+		{
+			case IRQ_TYPE_EDGE_RISING:
+				if (!gpio_val)
+					continue;
+				break;
+
+			case IRQ_TYPE_EDGE_FALLING:
+				if (gpio_val)
+					continue;
+				break;
+
+			case IRQ_TYPE_EDGE_BOTH:
+				if (!changed)
+					continue;
+				break;
+
+			default:
+				continue;
+		}
+
+		if (!gpio_val) {
+			dev_info(&priv->intf->dev, "irq low: offset %d, val %d\n",
+				offset, gpio_val);
 			ftdi_mpsse_dispatch_irq(priv, offset);
 		}
-		else if (gpio_val) {
+		if (gpio_val) {
+			dev_info(&priv->intf->dev, "irq high: offset %d, val %d\n",
+				offset, gpio_val);
 			ftdi_mpsse_dispatch_irq(priv, offset);
 		}
 	}
@@ -3052,6 +3107,15 @@ static int ftdi_irq_poll_function(void* argument)
 		}
 
 		next_poll_ms = jiffies_ms + irq_poll_period;
+
+		unsigned int offset = priv->mpsse_gpio.ngpio;
+		while(offset--)
+		{
+			if(!priv->irq_enabled[offset] || priv->irq_last_value_valid[offset])
+				continue;
+			priv->irq_last_value[offset] = ftdi_mpsse_gpio_get(&priv->mpsse_gpio, offset);
+			priv->irq_last_value_valid[offset] = true;
+		}
 
 		ftdi_mpsse_gpio_check(priv);
 
@@ -3124,7 +3188,8 @@ static int ftdi_mpsse_gpio_probe(struct usb_interface *intf)
 	chip->parent = parent;
 	chip->owner = THIS_MODULE;
 	chip->base = (param_gpio_base >= 0) ? param_gpio_base : -1;
-	chip->ngpio = FTDI_MPSSE_GPIOS;
+	/* Expose only non-SPI GPIOs: AD4-AD7 and AC0-AC3. */
+	chip->ngpio = FTDI_MPSSE_GPIOS - 4;
 	chip->can_sleep = true;
 	chip->set = ftdi_mpsse_gpio_set;
 	chip->get = ftdi_mpsse_gpio_get;
@@ -3139,7 +3204,7 @@ static int ftdi_mpsse_gpio_probe(struct usb_interface *intf)
 	for (i = 0; i < chip->ngpio; i++) {
 		int offs;
 
-		offs = i < 4 ? 0 : 4;
+		offs = i < 4 ? -4 : 4;
 		names[i] = devm_kasprintf(parent, GFP_KERNEL,
 					  "mpsse.%d-GPIO%c%d", priv->id,
 					  i < 4 ? 'L' : 'H', i - offs);
