@@ -2119,6 +2119,7 @@ static int ftdi_set_clock(struct usb_interface *intf, int clock_freq_hz)
 	case 0x6010: /* FT2232 */
 	case 0x6011: /* FT4232 */
 	case 0x6014: /* FT232H */
+	case 0x6999: /* Maxome FT2232H */
 	case 0x0146: /* GW16146 */
 		desc.len = 1;
 		if (clock_freq_hz <= (FTDI_CLK_30MHZ/65535)) {
@@ -2738,12 +2739,13 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 	/* Identify the FTDI channel from the alternate-setting (0=A,1=B,2=C,3=D) */
 	priv->index = intf->cur_altsetting->desc.bAlternateSetting + 1;
 	priv->intf = intf;
-	priv->info = (struct ft232h_intf_info *)id->driver_info;
+	priv->info = id->driver_info ?
+			(struct ft232h_intf_info *)id->driver_info :
+			(struct ft232h_intf_info *)&ft232h_spi_cfg_intf_info;
 
 	info = priv->info;
-	if (!info) {
-		dev_err(dev, "Missing device specific driver info...\n");
-		return -ENODEV;
+	if (!id->driver_info) {
+		dev_warn(dev, "Missing device specific driver info, using default SPI config\n");
 	}
 
 	mutex_init(&priv->io_mutex);
@@ -3299,6 +3301,8 @@ static void ft232h_intf_disconnect(struct usb_interface *intf)
 	ftdi_spi_remove(priv->spi_pdev);
 
 	info = (struct ft232h_intf_info *)priv->usb_dev_id->driver_info;
+	if (!info)
+		info = priv->info;
 	if (info && info->remove)
 		info->remove(intf);
 
