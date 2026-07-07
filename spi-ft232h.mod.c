@@ -233,4 +233,4 @@ MODULE_ALIAS("usb:v0403p6011d*dc*dsc*dp*ic*isc*ip*in*");
 MODULE_ALIAS("usb:v0403p6014d*dc*dsc*dp*ic*isc*ip*in*");
 MODULE_ALIAS("usb:v2BEBp0146d*dc*dsc*dp*ic*isc*ip*in*");
 
-MODULE_INFO(srcversion, "5629CB4B68893DBD5AD77C1");
+MODULE_INFO(srcversion, "030348B385F8786D9239AEA");
