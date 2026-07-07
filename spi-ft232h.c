@@ -3100,7 +3100,7 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 	}
 }
 
-#define FTDI_IRQ_POLL_PERIOD_MS  5
+#define FTDI_IRQ_POLL_PERIOD_MS  1
 static int ftdi_irq_poll_function(void* argument)
 {
 	struct ft232h_intf_priv *priv = (struct ft232h_intf_priv*)argument;
