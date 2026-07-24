@@ -107,7 +107,7 @@ module_param_cb(flush_per_block, &ftdi_flush_param_ops,
 MODULE_PARM_DESC(flush_per_block,
 		      "Force SEND_IMMEDIATE after every SPI payload block");
 
-static unsigned int param_rx_retry_us;
+static unsigned int param_rx_retry_us = 100;
 module_param_named(rx_retry_us, param_rx_retry_us, uint, 0600);
 MODULE_PARM_DESC(rx_retry_us, "Delay in usec between bulk-in polls when no data is returned");
 
@@ -147,7 +147,7 @@ MODULE_PARM_DESC(pipeline_depth,
 #ifdef CONFIG_GPIOLIB_IRQCHIP
 static unsigned int irq_poll_period = 0;
 module_param(irq_poll_period, uint, 0644);
-MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in ms (default 5 ms)");
+MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in us (default 100 us)");
 #endif
 
 #define SPI_INTF_DEVNAME	"spi-ft232h"
@@ -1319,11 +1319,12 @@ static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
 			maxp = SZ_512;
 
 		/*
-		 * Pipeline depth only helps on sizeable transfers.  Smaller control
-		 * messages complete more reliably through the legacy synchronous path.
+		 * BUG: The pipeline assumes a 1:1 mapping between URBs and SPI chunks,
+		 * which breaks when the FTDI hardware latency timer forces a short packet.
+		 * Force legacy synchronous path until a ring-buffer RX is implemented.
 		 */
-		if (t->len >= max_t(size_t, maxp * 2, SZ_1K))
-			use_pipeline = true;
+		//if (t->len >= max_t(size_t, maxp * 2, SZ_1K))
+		//	use_pipeline = true;
 	}
 
 	if (use_pipeline)
