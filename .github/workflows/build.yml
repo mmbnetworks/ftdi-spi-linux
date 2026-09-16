@@ -115,11 +115,23 @@ jobs:
           echo "target kernel: $KVER"
           echo "kver=$KVER" >> "$GITHUB_OUTPUT"
 
+      # Suppress autoinstall for the duration of dpkg. The postinst otherwise
+      # builds against the runner's own Azure kernel, which is far newer than
+      # anything this driver currently compiles against (no_llseek, and
+      # ida_simple_get/ida_simple_remove are gone; gpio_chip->set returns int)
+      # and is not a target platform. The explicit build in the next step
+      # covers the kernel we actually care about.
       - name: Install DKMS package
         run: |
           set -euo pipefail
           ls -la ftdi-spi-linux_*_all.deb
+          sudo mkdir -p /etc/dkms && sudo touch /etc/dkms/no-autoinstall
           sudo dpkg -i ftdi-spi-linux_*_all.deb
+          sudo rm -f /etc/dkms/no-autoinstall
+          # no-autoinstall makes common.postinst return before `dkms add`, so
+          # register the module explicitly.
+          VER=$(ls -d /usr/src/ftdi-spi-linux-* | sed 's|.*/ftdi-spi-linux-||')
+          sudo dkms add -m ftdi-spi-linux -v "$VER"
           dkms status
 
       - name: Build module via DKMS
