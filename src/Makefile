@@ -11,11 +11,10 @@ ZSTD_FLAGS := --ultra -19 -q -f
 
 obj-m += spi-ft232h.o
 
-all: modules
+all: modules compress
 
 modules:
 	$(MAKE) -C $(KDIR) M=$$PWD modules $(KBUILD_OPTIONS)
-	$(MAKE) compress
 
 modules_install:
 	$(MAKE) -C $(KDIR) M=$$PWD modules_install

@@ -6,3 +6,12 @@ modules.order
 *.ko*
 *.mod
 repro/
+spi-ft232h.mod.c
+
+debian/.debhelper/*
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/*.debhelper.log
+debian/ftdi-spi-linux/

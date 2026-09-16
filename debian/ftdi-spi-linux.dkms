@@ -1,0 +1,15 @@
+PACKAGE_NAME="ftdi-spi-linux"
+PACKAGE_VERSION="#MODULE_VERSION#"
+AUTOINSTALL="yes"
+
+# DKMS runs these from the build tree. Pass KDIR explicitly: the Makefile
+# otherwise defaults to /lib/modules/$(uname -r)/build, which is the *running*
+# kernel -- wrong whenever DKMS autoinstalls for a newly installed kernel.
+# $kernel_source_dir is set by DKMS to the headers of the target kernel.
+MAKE[0]="make modules KDIR=${kernel_source_dir}"
+CLEAN="make clean"
+
+# obj-m is spi-ft232h.o, so kbuild emits spi-ft232h.ko -- hyphen, not underscore.
+BUILT_MODULE_NAME[0]="spi-ft232h"
+BUILT_MODULE_LOCATION[0]="."
+DEST_MODULE_LOCATION[0]="/updates/dkms"

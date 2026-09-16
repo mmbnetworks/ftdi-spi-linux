@@ -34,18 +34,56 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential linux-headers-generic
+            build-essential zstd linux-headers-generic
 
       - name: Build module
-        run: make KDIR=/usr/src/$(ls /usr/src | grep generic | tail -1)
+        run: make -C src KDIR=/usr/src/$(ls /usr/src | grep generic | tail -1)
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: spi-ft232h-ubuntu-${{ matrix.arch }}
           path: |
-            spi-ft232h.ko
-            spi-ft232h.ko.zst
+            src/spi-ft232h.ko
+            src/spi-ft232h.ko.zst
+
+  # ---------------------------------------------------------------
+  # DKMS package build
+  # ---------------------------------------------------------------
+  dkms:
+    name: DKMS Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          path: ftdi-spi-linux
+
+      - name: Install dkms build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential debhelper dh-dkms dkms
+
+      - name: Build package
+        run: cd ftdi-spi-linux && dpkg-buildpackage -us -uc -b
+
+      # Building the .deb only proves the packaging is well-formed. Installing it
+      # is what exercises dkms.conf and catches a wrong BUILT_MODULE_NAME.
+      - name: Install package and verify DKMS build
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            linux-headers-$(uname -r)
+          sudo dpkg -i ftdi-spi-linux_*_all.deb
+          dkms status ftdi-spi-linux | tee /dev/stderr | grep -q installed
+          modinfo spi-ft232h
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ftdi-spi-linux
+          path: ftdi-spi-linux_*_all.deb
+
 
   # ---------------------------------------------------------------
   # Cross-compile for Raspberry Pi against the official RPi kernel
@@ -81,7 +119,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential bc flex bison libssl-dev libelf-dev \
+            build-essential zstd bc flex bison libssl-dev libelf-dev \
             ${{ matrix.cross_pkg }}
 
       - name: Cache Raspberry Pi kernel source
@@ -89,7 +127,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.RPI_LINUX }}
-          key: rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-${{ hashFiles('spi-ft232h.c') }}
+          key: rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-${{ hashFiles('src/spi-ft232h.c') }}
           restore-keys: |
             rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-
             rpi-linux-${{ matrix.arch }}-
@@ -113,7 +151,7 @@ jobs:
 
       - name: Build module
         run: |
-          make \
+          make -C src \
             ARCH=${{ matrix.arch }} \
             CROSS_COMPILE=${{ matrix.cross_compile }} \
             KBUILD_MODPOST_WARN=1 \
@@ -124,5 +162,5 @@ jobs:
         with:
           name: spi-ft232h-${{ matrix.artifact }}
           path: |
-            spi-ft232h.ko
-            spi-ft232h.ko.zst
+            src/spi-ft232h.ko
+            src/spi-ft232h.ko.zst

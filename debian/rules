@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+include /usr/share/dpkg/default.mk
+
+# DEB_VERSION_UPSTREAM comes from dpkg's pkg-info.mk: "1.4" for a 1.4-1 release.
+# This is the DKMS module version, so it must match the /usr/src directory name.
+DKMS_SRC := debian/ftdi-spi-linux/usr/src/ftdi-spi-linux-$(DEB_VERSION_UPSTREAM)
+
+%:
+	dh $@ --with dkms
+
+# There is nothing to build at package time -- DKMS compiles on the target host.
+override_dh_auto_build:
+
+override_dh_auto_clean:
+	$(MAKE) -C src clean
+
+# Install only the build inputs. A blanket `cp -a src/*` drags any stale .ko/.o/
+# Module.symvers from a local build into /usr/src, and a leftover (often empty)
+# Module.symvers there breaks modpost during the DKMS build.
+override_dh_auto_install:
+	install -d $(DKMS_SRC)
+	install -m 644 src/Makefile src/Kconfig src/spi-ft232h.c src/ft232h-intf.h $(DKMS_SRC)/
+
+override_dh_dkms:
+	dh_dkms -V $(DEB_VERSION_UPSTREAM)

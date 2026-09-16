@@ -3688,6 +3688,9 @@ static struct usb_device_id ft232h_intf_table[] = {
 	{ USB_DEVICE(0x0403, 0x6011), .driver_info = (kernel_ulong_t)&ft232h_spi_cfg_intf_info },
 	{ USB_DEVICE(0x0403, 0x6014), .driver_info = (kernel_ulong_t)&ft232h_spi_cfg_intf_info },
 #endif
+	/* MMB Gen3 Wi-SUN mPCIe card. Not guarded by CONFIG_USB_SERIAL_FTDI_SIO:
+	 * ftdi_sio does not claim this PID, so there is no conflict to avoid. */
+	{ USB_DEVICE(0x0403, 0x6900), .driver_info = (kernel_ulong_t)&ft232h_spi_cfg_intf_info },
 	{ USB_DEVICE(0x2beb, 0x0146), .driver_info = (kernel_ulong_t)&ft232h_spi_cfg_intf_info },
 	{}
 };
