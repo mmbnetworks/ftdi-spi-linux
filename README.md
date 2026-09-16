@@ -19,6 +19,10 @@ Load-time parameters allow the data path to be tuned per target. Parameters are 
 | `rx_retry_us` | `0` | Optional sleep between empty USB reads. Setting `25`–`75` reduces CPU burn during long bursts. |
 | `enable_stats` | `1` | Enable debugfs statistics collection (see below). |
 | `pipeline_depth` | profile | Number of concurrent bulk-IN URBs. If left at `0`, the driver picks based on profile (legacy:1, balanced:2, aggressive:4). |
+| `irq_poll_period` | `1000` | Base GPIO poll period in microseconds. |
+| `irq_poll_max_us` | `2000` | Deadline budget for maximum time between GPIO polls when strict mode is enabled. |
+| `irq_poll_guard_us` | `250` | Guard band before deadline that triggers cooperative polls in SPI transfer loops. |
+| `irq_poll_strict` | `1` | Enables strict deadline enforcement and cooperative polling during heavy SPI traffic. |
 
 The legacy behaviour (profile `0`) matches earlier releases. Profiles `1` and `2` raise internal burst sizes and buffer allocations without requiring explicit `max_block`/`bulk_in_buf_kb` overrides.
 
@@ -35,6 +39,18 @@ Use module parameters to switch between predictable legacy behaviour and high-th
   ```
 
 The aggressive preset expects a stable HS USB link and enables statistics by default so that tuning can be verified. When left at the default settings the driver collects runtime metrics and may automatically scale back zero-copy TX or pipeline depth if the host link indicates repeated stalls.
+
+## GPIO IRQ latency controls
+
+When GPIO line IRQs are active, the driver uses a strict periodic polling thread with a microsecond cadence and deadline tracking.
+
+For latency-focused workloads, keep strict mode enabled and tune:
+
+```bash
+modprobe spi-ft232h irq_poll_strict=1 irq_poll_period=1000 irq_poll_max_us=2000 irq_poll_guard_us=250
+```
+
+The chunk-level scheduler can clamp per-chunk SPI payloads when IRQ lines are enabled, reducing latency jitter while minimizing throughput impact.
 
 Full-duplex messages now share the same zero-copy fast path that previously applied only to TX-only workloads. Transfers using 8-bit words and >=4 KiB bursts avoid an extra memcpy, and the chunk-level stats exported via debugfs capture both TX-only and duplex pipelines so that adaptive autotuning decisions are visible in a single set of counters.
 
