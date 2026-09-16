@@ -150,15 +150,10 @@ static unsigned int irq_poll_period = 1000;
 module_param(irq_poll_period, uint, 0644);
 MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in us (default 1000 us)");
 
-static unsigned int irq_poll_max_us = 2000;
+static unsigned int irq_poll_max_us = 10000;
 module_param(irq_poll_max_us, uint, 0644);
 MODULE_PARM_DESC(irq_poll_max_us,
-		      "Maximum allowed time between GPIO polls in us (default 2000 us)");
-
-static unsigned int irq_poll_guard_us = 250;
-module_param(irq_poll_guard_us, uint, 0644);
-MODULE_PARM_DESC(irq_poll_guard_us,
-		      "Guard band in us before forcing cooperative GPIO polls (default 250 us)");
+		      "Maximum allowed time between GPIO polls in us (default 10000 us)");
 
 static bool irq_poll_strict = true;
 module_param(irq_poll_strict, bool, 0644);
@@ -217,12 +212,9 @@ struct ft232h_intf_priv {
 	bool		irq_last_value_valid[FTDI_MPSSE_GPIOS];
 	u32			irq_poll_period_us;
 	u32			irq_poll_max_us;
-	u32			irq_poll_guard_us;
 	u64			irq_last_poll_ns;
-	u64			irq_max_poll_gap_ns;
-	u64			irq_deadline_miss_cnt;
-	u64			irq_coop_poll_cnt;
-	u64			irq_total_poll_cnt;
+	/* Bumped whenever the MPSSE is re-initialised under the SPI layer. */
+	u32			mpsse_epoch;
 };
 
 /* Cumulative transfer counters exported through debugfs for benchmarking. */
@@ -286,6 +278,7 @@ struct ftdi_spi {
 	u8 xfer_buf[SZ_64K];
 	u16 last_mode;
 	u32 last_speed_hz;
+	u32 mpsse_epoch;
 	size_t max_burst_bytes;
 	bool flush_per_block;
 	u32 rx_retry_delay_us;
@@ -321,12 +314,14 @@ static int ftdi_mpsse_set_port_pins(struct ft232h_intf_priv *priv, bool low);
 
 #ifdef CONFIG_GPIOLIB_IRQCHIP
 static size_t ftdi_irq_chunk_cap_bytes(struct ftdi_spi *priv, u32 speed_hz);
+static void ftdi_spi_irq_yield(struct ftdi_spi *priv, size_t remaining);
 #else
 static inline size_t ftdi_irq_chunk_cap_bytes(struct ftdi_spi *priv,
 					      u32 speed_hz)
 {
 	return SIZE_MAX;
 }
+static inline void ftdi_spi_irq_yield(struct ftdi_spi *priv, size_t rem) { }
 #endif
 
 enum gpiol {
@@ -1235,6 +1230,7 @@ static int ftdi_spi_tx_rx_legacy(struct ftdi_spi *priv, struct spi_device *spi,
 		remaining -= stride;
 		tx_offs += stride;
 		dev_dbg(dev, "%s: WR remains %zu\n", __func__, remaining);
+		ftdi_spi_irq_yield(priv, remaining);
 	}
 
 	ret = 0;
@@ -1328,6 +1324,7 @@ static int ftdi_spi_tx_rx_pipeline(struct ftdi_spi *priv, struct spi_device *spi
 		tx_offs += stride;
 		rx_offs += stride;
 		remaining -= stride;
+		ftdi_spi_irq_yield(priv, remaining);
 	}
 
 	ret = ftdi_pipeline_wait_all(priv, priv_intf);
@@ -1509,6 +1506,7 @@ copy_path:
 			__func__, stride);
 		remaining -= stride;
 		tx_offs += stride;
+		ftdi_spi_irq_yield(priv, remaining);
 	} while (remaining);
 
 	ret = 0;
@@ -1606,6 +1604,7 @@ static int ftdi_spi_rx(struct ftdi_spi *priv, struct spi_transfer *xfer)
 		remaining -= stride;
 		dev_dbg(dev, "%s: chunk %zu done, remaining %zu\n",
 			__func__, stride, remaining);
+		ftdi_spi_irq_yield(priv, remaining);
 	}
 
 	ret = 0;
@@ -1623,9 +1622,18 @@ static int ftdi_spi_transfer_one(struct spi_controller *ctlr,
 	struct device *dev = &priv->pdev->dev;
 	int ret = 0;
 	ktime_t start = 0;
+	u32 epoch;
 
 	if (!xfer->len)
 		return 0;
+
+	epoch = priv->iops->get_mpsse_epoch(priv->intf);
+	if (priv->mpsse_epoch != epoch) {
+		/* MPSSE re-initialised under us: cached clock and mode stale. */
+		priv->mpsse_epoch = epoch;
+		priv->last_speed_hz = 0;
+		priv->last_mode = 0xffff;
+	}
 
 	if (priv->last_speed_hz != xfer->speed_hz) {
 		dev_info(dev, "%s: new speed %u\n", __func__, (int)xfer->speed_hz);
@@ -1784,7 +1792,7 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 	    !pd->ops->lock || !pd->ops->unlock ||
 	    !pd->ops->set_bitmode ||
 	    !pd->ops->cfg_bus_pins ||
-	    !pd->ops->set_clock ||
+	    !pd->ops->set_clock || !pd->ops->get_mpsse_epoch ||
 	    !pd->ops->set_latency ||
 	    !pd->ops->gpio_get ||
 	    !pd->ops->gpio_set ||
@@ -2147,7 +2155,7 @@ exit:
  *
  * Return: If successful, 0. Otherwise a negative error number.
  */
-static int ftdi_set_clock(struct usb_interface *intf, int clock_freq_hz)
+static int ftdi_set_clock_unlocked(struct usb_interface *intf, int clock_freq_hz)
 {
 	struct ft232h_intf_priv *priv = usb_get_intfdata(intf);
 	struct bulk_desc desc;
@@ -2201,6 +2209,32 @@ static int ftdi_set_clock(struct usb_interface *intf, int clock_freq_hz)
 	ret = ftdi_bulk_xfer(intf, &desc);
 
 	return ret;
+}
+
+/*
+ * DIS_DIV_5 and TCK_DIVISOR are separate bulk writes; GPIO traffic splitting
+ * them leaves the divisor and the divide-by-5 flag describing different rates.
+ */
+static int ftdi_set_clock(struct usb_interface *intf, int clock_freq_hz)
+{
+	struct ft232h_intf_priv *priv = usb_get_intfdata(intf);
+	int ret;
+
+	if (!priv)
+		return -ENODEV;
+
+	mutex_lock(&priv->ops_mutex);
+	ret = ftdi_set_clock_unlocked(intf, clock_freq_hz);
+	mutex_unlock(&priv->ops_mutex);
+
+	return ret;
+}
+
+static u32 ftdi_get_mpsse_epoch(struct usb_interface *intf)
+{
+	struct ft232h_intf_priv *priv = usb_get_intfdata(intf);
+
+	return priv ? READ_ONCE(priv->mpsse_epoch) : 0;
 }
 
 /*
@@ -2411,19 +2445,19 @@ static int ftdi_mpsse_recover_channel(struct ft232h_intf_priv *priv)
 	if (ret < 0)
 		return ret;
 
-	priv->tx_buf[0] = DIS_DIV_5;
-	priv->tx_buf[1] = DIS_ADAPTIVE;
-	priv->tx_buf[2] = DIS_3_PHASE;
-	ret = ftdi_write_data(priv->intf, priv->tx_buf, 3);
+	priv->tx_buf[0] = DIS_ADAPTIVE;
+	priv->tx_buf[1] = DIS_3_PHASE;
+	ret = ftdi_write_data(priv->intf, priv->tx_buf, 2);
 	if (ret < 0)
 		return ret;
 
-	priv->tx_buf[0] = TCK_DIVISOR;
-	priv->tx_buf[1] = div_value(60000000);
-	priv->tx_buf[2] = div_value(60000000) >> 8;
-	ret = ftdi_write_data(priv->intf, priv->tx_buf, 3);
-	if (ret < 0)
-		return ret;
+	/*
+	 * Do not program TCK_DIVISOR here: the requested rate is cached in
+	 * struct ftdi_spi::last_speed_hz, out of reach, so any rate chosen here
+	 * sticks until the requested rate happens to change. Bump the epoch and
+	 * let the next transfer reprogram clock and mode.
+	 */
+	WRITE_ONCE(priv->mpsse_epoch, priv->mpsse_epoch + 1);
 
 	ret = ftdi_mpsse_set_port_pins(priv, true);
 	if (ret < 0)
@@ -2758,6 +2792,7 @@ static const struct ft232h_intf_ops ft232h_intf_ops = {
 	.init_pins = ftdi_mpsse_init_pins,
 	.cfg_bus_pins = ftdi_mpsse_cfg_bus_pins,
 	.set_clock = ftdi_set_clock,
+	.get_mpsse_epoch = ftdi_get_mpsse_epoch,
 	.set_latency = ftdi_set_latency,
 	.gpio_get = ftdi_gpio_get,
 	.gpio_set = ftdi_gpio_set,
@@ -3178,8 +3213,7 @@ static int ftdi_mpsse_gpio_to_irq(struct gpio_chip *chip,
 
 #ifdef CONFIG_GPIOLIB_IRQCHIP
 #define FTDI_IRQ_POLL_PERIOD_US_DEFAULT	1000U
-#define FTDI_IRQ_POLL_MAX_US_DEFAULT	2000U
-#define FTDI_IRQ_POLL_MIN_US		200U
+#define FTDI_IRQ_POLL_MIN_US		1000U	/* a GPIO read costs ~1 ms of USB */
 
 static void ftdi_mpsse_dispatch_irq(struct ft232h_intf_priv *priv,
 					    unsigned int offset)
@@ -3221,36 +3255,23 @@ static bool ftdi_irq_lines_enabled(struct ft232h_intf_priv *priv,
 	return low || high;
 }
 
-static void ftdi_irq_poll_account_interval(struct ft232h_intf_priv *priv,
-					   bool cooperative)
+/* Report, rather than silently count, a poll that missed its deadline. */
+static void ftdi_irq_poll_account_interval(struct ft232h_intf_priv *priv)
 {
 	u64 now_ns = ktime_get_boottime_ns();
-	u64 max_gap_ns = (u64)max_t(u32, priv->irq_poll_max_us,
-					   FTDI_IRQ_POLL_MAX_US_DEFAULT) * NSEC_PER_USEC;
-	u64 gap_ns;
-
-	if (!priv->irq_last_poll_ns) {
-		priv->irq_last_poll_ns = now_ns;
-		priv->irq_total_poll_cnt++;
-		if (cooperative)
-			priv->irq_coop_poll_cnt++;
-		return;
-	}
-
-	gap_ns = now_ns - priv->irq_last_poll_ns;
-	if (gap_ns > priv->irq_max_poll_gap_ns)
-		priv->irq_max_poll_gap_ns = gap_ns;
-	if (irq_poll_strict && gap_ns > max_gap_ns)
-		priv->irq_deadline_miss_cnt++;
+	u64 gap_ns = priv->irq_last_poll_ns ? now_ns - priv->irq_last_poll_ns : 0;
 
 	priv->irq_last_poll_ns = now_ns;
-	priv->irq_total_poll_cnt++;
-	if (cooperative)
-		priv->irq_coop_poll_cnt++;
+
+	if (irq_poll_strict &&
+	    gap_ns > (u64)priv->irq_poll_max_us * NSEC_PER_USEC)
+		dev_warn_ratelimited(&priv->intf->dev,
+				     "GPIO poll gap %llu us exceeds %u us budget\n",
+				     div_u64(gap_ns, NSEC_PER_USEC),
+				     priv->irq_poll_max_us);
 }
 
-static int ftdi_mpsse_gpio_check_locked(struct ft232h_intf_priv *priv,
-					 bool cooperative)
+static int ftdi_mpsse_gpio_check_locked(struct ft232h_intf_priv *priv)
 {
 	struct gpio_chip *chip = &priv->mpsse_gpio;
 	unsigned int offset;
@@ -3261,7 +3282,7 @@ static int ftdi_mpsse_gpio_check_locked(struct ft232h_intf_priv *priv,
 	bool have_high = false;
 
 	if (!ftdi_irq_lines_enabled(priv, &have_low, &have_high)) {
-		ftdi_irq_poll_account_interval(priv, cooperative);
+		ftdi_irq_poll_account_interval(priv);
 		return 0;
 	}
 
@@ -3342,14 +3363,13 @@ static int ftdi_mpsse_gpio_check_locked(struct ft232h_intf_priv *priv,
 		ftdi_mpsse_dispatch_irq(priv, offset);
 	}
 
-	ftdi_irq_poll_account_interval(priv, cooperative);
+	ftdi_irq_poll_account_interval(priv);
 	return 0;
 }
 
 static size_t ftdi_irq_chunk_cap_bytes(struct ftdi_spi *priv, u32 speed_hz)
 {
 	struct ft232h_intf_priv *intf_priv = usb_get_intfdata(priv->intf);
-	u32 max_us;
 	u64 bytes;
 
 	if (!irq_poll_strict || !intf_priv)
@@ -3365,13 +3385,30 @@ static size_t ftdi_irq_chunk_cap_bytes(struct ftdi_spi *priv, u32 speed_hz)
 	if (!speed_hz)
 		speed_hz = 1000000;
 
-	max_us = max_t(u32, intf_priv->irq_poll_max_us,
-		       FTDI_IRQ_POLL_MAX_US_DEFAULT);
-	bytes = div_u64((u64)speed_hz * max_us, 8 * USEC_PER_SEC);
-	bytes = max_t(u64, bytes / 2, 256);
-	bytes = min_t(u64, bytes, SZ_4K);
+	/* Half the budget, so a poll still fits beside the chunk. The 64-byte
+	 * floor bounds command overhead and only binds below ~500 kHz. */
+	bytes = div_u64((u64)speed_hz * intf_priv->irq_poll_max_us,
+			2 * 8 * USEC_PER_SEC);
+	bytes = clamp_t(u64, bytes, 64, SZ_4K);
 
 	return (size_t)bytes;
+}
+
+/*
+ * Chunk caps only bound GPIO latency if the poll thread can take ops_mutex
+ * between chunks, and every transfer path holds it across the whole loop.
+ */
+static void ftdi_spi_irq_yield(struct ftdi_spi *priv, size_t remaining)
+{
+	struct ft232h_intf_priv *intf_priv = usb_get_intfdata(priv->intf);
+
+	if (!remaining || !irq_poll_strict || !intf_priv ||
+	    !ftdi_irq_lines_enabled(intf_priv, NULL, NULL))
+		return;
+
+	priv->iops->unlock(priv->intf);
+	cond_resched();
+	priv->iops->lock(priv->intf);
 }
 
 static int ftdi_irq_poll_function(void *argument)
@@ -3391,7 +3428,7 @@ static int ftdi_irq_poll_function(void *argument)
 		next_poll_ns += period_ns;
 
 		mutex_lock(&priv->ops_mutex);
-		if (ftdi_mpsse_gpio_check_locked(priv, false) < 0)
+		if (ftdi_mpsse_gpio_check_locked(priv) < 0)
 			dev_dbg_ratelimited(&priv->intf->dev, "poll cycle failed\n");
 		mutex_unlock(&priv->ops_mutex);
 
@@ -3541,20 +3578,11 @@ static int ftdi_mpsse_gpio_probe(struct usb_interface *intf)
 	priv->irq_poll_period_us = max_t(u32, irq_poll_period, FTDI_IRQ_POLL_MIN_US);
 	priv->irq_poll_max_us = max_t(u32, irq_poll_max_us,
 				      priv->irq_poll_period_us);
-	priv->irq_poll_guard_us = min_t(u32, irq_poll_guard_us,
-					priv->irq_poll_max_us / 2);
-	if (!priv->irq_poll_guard_us)
-		priv->irq_poll_guard_us = 1;
 	priv->irq_last_poll_ns = 0;
-	priv->irq_max_poll_gap_ns = 0;
-	priv->irq_deadline_miss_cnt = 0;
-	priv->irq_coop_poll_cnt = 0;
-	priv->irq_total_poll_cnt = 0;
 
-	dev_info(parent,
-		 "gpio-irq polling: period=%u us max=%u us guard=%u us strict=%u\n",
+	dev_info(parent, "gpio-irq polling: period=%u us max=%u us strict=%u\n",
 		 priv->irq_poll_period_us, priv->irq_poll_max_us,
-		 priv->irq_poll_guard_us, irq_poll_strict ? 1 : 0);
+		 irq_poll_strict ? 1 : 0);
 
 	init_completion(&priv->gpio_thread_complete);
 	priv->gpio_thread = kthread_run(&ftdi_irq_poll_function, priv, "ftdi-irq-poll");
