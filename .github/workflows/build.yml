@@ -28,7 +28,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
 
       - name: Install kernel headers
         run: |
@@ -37,7 +37,7 @@ jobs:
             build-essential linux-headers-generic
 
       - name: Build module
-        run: make KDIR=/usr/src/linux-headers-$(ls /usr/src | grep generic | tail -1)
+        run: make KDIR=/usr/src/$(ls /usr/src | grep generic | tail -1)
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -75,7 +75,7 @@ jobs:
       CROSS_COMPILE: ${{ matrix.cross_compile }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
 
       - name: Install cross-compilation toolchain
         run: |
@@ -116,6 +116,7 @@ jobs:
           make \
             ARCH=${{ matrix.arch }} \
             CROSS_COMPILE=${{ matrix.cross_compile }} \
+            KBUILD_MODPOST_WARN=1 \
             KDIR="$RPI_LINUX"
 
       - name: Upload artifacts
