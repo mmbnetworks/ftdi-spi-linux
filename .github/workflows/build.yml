@@ -36,8 +36,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential zstd linux-headers-generic
 
+      # sort -V, not `tail -1` on ls output: lexically 6.8.0-9-generic sorts
+      # after 6.8.0-84-generic, so a plain tail picks the older ABI whenever two
+      # header trees are installed.
       - name: Build module
-        run: make -C src KDIR=/usr/src/$(ls /usr/src | grep generic | tail -1)
+        run: |
+          set -euo pipefail
+          KVER=$(ls -1 /usr/src \
+                 | sed -n 's/^linux-headers-\(.*-generic\)$/\1/p' \
+                 | sort -V | tail -1)
+          [ -n "$KVER" ] || { echo "no linux-headers-*-generic found"; exit 1; }
+          echo "Building against $KVER"
+          make -C src KDIR="/usr/src/linux-headers-$KVER"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -68,15 +78,35 @@ jobs:
       - name: Build package
         run: cd ftdi-spi-linux && dpkg-buildpackage -us -uc -b
 
-      # Building the .deb only proves the packaging is well-formed. Installing it
+      # Building the .deb only proves the packaging is well-formed. Compiling it
       # is what exercises dkms.conf and catches a wrong BUILT_MODULE_NAME.
+      #
+      # Build against linux-headers-generic rather than the runner's own kernel:
+      # GitHub runners boot an Azure kernel whose matching linux-headers package
+      # is not reliably in the archive. Note that missing headers are NOT fatal
+      # to dkms -- common.postinst skips that kernel and exits 0 -- so the
+      # explicit build/install below is what actually guarantees a compile
+      # happened, rather than the job passing having built nothing.
       - name: Install package and verify DKMS build
         run: |
-          sudo apt-get install -y --no-install-recommends \
-            linux-headers-$(uname -r)
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends linux-headers-generic
+
+          KVER=$(ls -1 /usr/src \
+                 | sed -n 's/^linux-headers-\(.*-generic\)$/\1/p' \
+                 | sort -V | tail -1)
+          [ -n "$KVER" ] || { echo "no linux-headers-*-generic found"; exit 1; }
+          echo "Building against $KVER (runner is running $(uname -r))"
+
           sudo dpkg -i ftdi-spi-linux_*_all.deb
-          dkms status ftdi-spi-linux | tee /dev/stderr | grep -q installed
-          modinfo spi-ft232h
+          VER=$(ls -d /usr/src/ftdi-spi-linux-* | sed 's|.*/ftdi-spi-linux-||')
+
+          sudo dkms build   -m ftdi-spi-linux -v "$VER" -k "$KVER"
+          sudo dkms install -m ftdi-spi-linux -v "$VER" -k "$KVER"
+
+          dkms status -m ftdi-spi-linux -k "$KVER" | tee /dev/stderr \
+            | grep -q ': installed'
+          modinfo /lib/modules/"$KVER"/updates/dkms/spi-ft232h.ko*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
