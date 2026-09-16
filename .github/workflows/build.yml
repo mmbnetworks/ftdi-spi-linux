@@ -83,30 +83,75 @@ jobs:
       #
       # Build against linux-headers-generic rather than the runner's own kernel:
       # GitHub runners boot an Azure kernel whose matching linux-headers package
-      # is not reliably in the archive. Note that missing headers are NOT fatal
-      # to dkms -- common.postinst skips that kernel and exits 0 -- so the
-      # explicit build/install below is what actually guarantees a compile
-      # happened, rather than the job passing having built nothing.
-      - name: Install package and verify DKMS build
+      # is not reliably in the archive. Absent headers are NOT fatal to dkms --
+      # common.postinst skips that kernel and exits 0 -- so the explicit
+      # build/install below is what guarantees a compile actually happened.
+      #
+      # Kept as separate steps so a failure is attributable from the job summary
+      # without having to open the log.
+      - name: Install generic kernel headers
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends linux-headers-generic
+          echo "runner kernel: $(uname -r)"
+          echo "--- /usr/src ---";     ls -1 /usr/src
+          echo "--- /lib/modules ---"; ls -1 /lib/modules
 
+      - name: Resolve target kernel
+        id: kver
+        run: |
+          set -euo pipefail
           KVER=$(ls -1 /usr/src \
                  | sed -n 's/^linux-headers-\(.*-generic\)$/\1/p' \
                  | sort -V | tail -1)
-          [ -n "$KVER" ] || { echo "no linux-headers-*-generic found"; exit 1; }
-          echo "Building against $KVER (runner is running $(uname -r))"
+          if [ -z "$KVER" ]; then
+            echo "::error::no linux-headers-*-generic under /usr/src"; exit 1
+          fi
+          if [ ! -d "/lib/modules/$KVER/build" ]; then
+            echo "::error::/lib/modules/$KVER/build is missing"
+            ls -la "/lib/modules/$KVER" || true
+            exit 1
+          fi
+          echo "target kernel: $KVER"
+          echo "kver=$KVER" >> "$GITHUB_OUTPUT"
 
+      - name: Install DKMS package
+        run: |
+          set -euo pipefail
+          ls -la ftdi-spi-linux_*_all.deb
           sudo dpkg -i ftdi-spi-linux_*_all.deb
-          VER=$(ls -d /usr/src/ftdi-spi-linux-* | sed 's|.*/ftdi-spi-linux-||')
+          dkms status
 
+      - name: Build module via DKMS
+        run: |
+          set -euo pipefail
+          KVER='${{ steps.kver.outputs.kver }}'
+          VER=$(ls -d /usr/src/ftdi-spi-linux-* | sed 's|.*/ftdi-spi-linux-||')
+          echo "module version: $VER"
           sudo dkms build   -m ftdi-spi-linux -v "$VER" -k "$KVER"
           sudo dkms install -m ftdi-spi-linux -v "$VER" -k "$KVER"
 
-          dkms status -m ftdi-spi-linux -k "$KVER" | tee /dev/stderr \
-            | grep -q ': installed'
-          modinfo /lib/modules/"$KVER"/updates/dkms/spi-ft232h.ko*
+      - name: Verify module installed
+        run: |
+          set -euo pipefail
+          KVER='${{ steps.kver.outputs.kver }}'
+          # Capture first rather than `... | tee /dev/stderr | grep -q`: grep -q
+          # exits on the first match and can SIGPIPE tee, which pipefail then
+          # turns into a spurious failure.
+          status=$(dkms status -m ftdi-spi-linux -k "$KVER")
+          echo "$status"
+          echo "$status" | grep -q ': installed'
+          ko=$(ls -1 /lib/modules/"$KVER"/updates/dkms/spi-ft232h.ko* | head -1)
+          echo "installed module: $ko"
+          modinfo "$ko"
+
+      - name: DKMS build log (on failure)
+        if: failure()
+        run: |
+          for f in /var/lib/dkms/ftdi-spi-linux/*/build/make.log; do
+            [ -f "$f" ] && { echo "===== $f ====="; cat "$f"; }
+          done
+          sudo dkms status || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
