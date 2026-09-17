@@ -162,6 +162,9 @@ MODULE_PARM_DESC(irq_poll_strict,
 		      "Enable strict GPIO poll deadline tracking and latency-biased SPI chunk sizing");
 #endif
 
+/* Longest bulk-out command the driver builds is 3 bytes; round up. */
+#define FTDI_TX_BUF_SZ		8
+
 #define SPI_INTF_DEVNAME	"spi-ft232h"
 
 /* SPI controller/master Compatibility Layer */
@@ -205,7 +208,12 @@ struct ft232h_intf_priv {
 	u8			gpioh_mask;
 	u8			gpiol_dir;
 	u8			gpioh_dir;
-	u8			tx_buf[4];
+	/*
+	 * Command buffer for bulk-out. Allocated separately rather than
+	 * embedded here so that it can be placed in ZONE_DMA; see the
+	 * allocation in ft232h_intf_probe() for why that matters.
+	 */
+	u8			*tx_buf;
 
 	struct irq_chip		mpsse_irq;
 	int			irq_base;
@@ -2937,6 +2945,14 @@ static const struct ft232h_intf_info ft232h_spi_cfg_intf_info = {
 	.plat_data  = &ft232h_spi_cfg_plat_data,
 };
 
+static void ftdi_free_dma_bufs(struct ft232h_intf_priv *priv)
+{
+	kfree(priv->bulk_in_buf);
+	priv->bulk_in_buf = NULL;
+	kfree(priv->tx_buf);
+	priv->tx_buf = NULL;
+}
+
 static int ft232h_intf_probe(struct usb_interface *intf,
 			     const struct usb_device_id *id)
 {
@@ -3006,18 +3022,43 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 				     priv->bulk_in_pkt_sz, (size_t)SZ_64K);
 	priv->bulk_in_sz = roundup(priv->bulk_in_sz, priv->bulk_in_pkt_sz);
 
-	priv->bulk_in_buf = devm_kmalloc(dev, priv->bulk_in_sz, GFP_KERNEL);
-	if (!priv->bulk_in_buf)
+	priv->udev = usb_get_dev(interface_to_usbdev(intf));
+
+	/*
+	 * Both USB transfer buffers come from ZONE_DMA. The BCM2711 dwc2
+	 * controller's dma-ranges only reach the low 1 GiB of RAM, so on a
+	 * board with more memory than that an ordinary kmalloc() buffer
+	 * usually lands outside the controller's window, and every transfer
+	 * is then copied through a SWIOTLB bounce buffer.
+	 *
+	 * GFP_DMA rather than usb_alloc_coherent(): coherent memory is a
+	 * non-cacheable vmalloc remap on arm64, and usb_bulk_msg() maps its
+	 * buffer with dma_map_single(), which rejects vmalloc addresses.
+	 * ZONE_DMA memory is linear-mapped, so it maps directly with no
+	 * bounce and stays usable with usb_bulk_msg().
+	 */
+	priv->bulk_in_buf = kmalloc(priv->bulk_in_sz, GFP_KERNEL | GFP_DMA);
+	if (!priv->bulk_in_buf) {
+		usb_put_dev(priv->udev);
 		return -ENOMEM;
+	}
+
+	priv->tx_buf = kmalloc(FTDI_TX_BUF_SZ, GFP_KERNEL | GFP_DMA);
+	if (!priv->tx_buf) {
+		ftdi_free_dma_bufs(priv);
+		usb_put_dev(priv->udev);
+		return -ENOMEM;
+	}
 
 	dev_dbg(dev, "bulk-in cfg: pkt=%zu buf=%zu\n",
 		priv->bulk_in_pkt_sz, priv->bulk_in_sz);
 
-	priv->udev = usb_get_dev(interface_to_usbdev(intf));
-
 	priv->id = ida_simple_get(&ftdi_devid_ida, 0, 0, GFP_KERNEL);
-	if (priv->id < 0)
+	if (priv->id < 0) {
+		ftdi_free_dma_bufs(priv);
+		usb_put_dev(priv->udev);
 		return priv->id;
+	}
 
 	if (info->probe) {
 		ret = info->probe(intf, info->plat_data);
@@ -3740,6 +3781,7 @@ static void ft232h_intf_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(intf, NULL);
 	mutex_unlock(&priv->io_mutex);
 
+	ftdi_free_dma_bufs(priv);
 	usb_put_dev(priv->udev);
 	ida_simple_remove(&ftdi_devid_ida, priv->id);
 
