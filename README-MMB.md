@@ -110,6 +110,22 @@ Note that `enable_stats` defaults to **on** (`param_enable_stats = true`),
 despite its `MODULE_PARM_DESC` text claiming "default disabled". Add
 `enable_stats=0` to the options line to turn metrics collection off.
 
+#### Files in `src/` that are deliberately not packaged
+
+`src/` carries two modprobe snippets inherited from upstream. Neither is
+installed by the DKMS package, and that is intentional:
+
+| File | Contents | Why it is not installed |
+|------|----------|-------------------------|
+| `src/spi-ft232h.conf` | `softdep spi_ft232h post: nrc` | Loads the Newracom `nrc` driver after this one. `nrc` is not present on MMB Gen3 hardware, so the softdep has nothing to resolve. |
+| `src/blacklist-ftdi_sio.conf` | blacklists `ftdi_sio` | Only needed for boards using the `0403:6011`/`6014` IDs, which this driver compiles out when `CONFIG_USB_SERIAL_FTDI_SIO` is enabled. The MMB PID `0403:6900` is not claimed by `ftdi_sio`. |
+
+**Do not install `src/spi-ft232h.conf` to `/etc/modprobe.d/`.** It shares a
+basename with the options file described above, so packaging it under that path
+would overwrite the deployed parameter tuning with an unrelated softdep line. If
+the softdep is ever genuinely needed, install it under a distinct name such as
+`/etc/modprobe.d/ftdi-spi-linux-softdep.conf`.
+
 ### Building out-of-tree (without DKMS)
 
 The module sources live in `src/`:
