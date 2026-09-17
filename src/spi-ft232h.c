@@ -28,6 +28,7 @@
 #include <linux/kthread.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/wait.h>
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
 #include <linux/math64.h>
@@ -196,6 +197,8 @@ struct ft232h_intf_priv {
 	struct gpiod_lookup_table	*lookup_gpios;
 	struct task_struct		*gpio_thread;
 	struct completion		gpio_thread_complete;
+	/* Parks the poll thread while no GPIO line events are requested. */
+	wait_queue_head_t		irq_poll_wq;
 
 	struct gpio_chip	mpsse_gpio;
 	u8			gpiol_mask;
@@ -2967,6 +2970,7 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 
 	mutex_init(&priv->io_mutex);
 	mutex_init(&priv->ops_mutex);
+	init_waitqueue_head(&priv->irq_poll_wq);
 	usb_set_intfdata(intf, priv);
 
 	if (!priv->bulk_in_pkt_sz) {
@@ -3198,6 +3202,10 @@ static void mpsse_irq_enable_disable(struct irq_data *data, bool enable)
 
 	WRITE_ONCE(priv->irq_enabled[irq], enable);
 	WRITE_ONCE(priv->irq_last_value_valid[irq], false);
+
+	/* The poll thread parks itself when no line is enabled; wake it. */
+	if (enable)
+		wake_up(&priv->irq_poll_wq);
 }
 
 static void mpsse_irq_enable(struct irq_data *data)
@@ -3244,12 +3252,28 @@ static int ftdi_mpsse_gpio_to_irq(struct gpio_chip *chip,
 	WRITE_ONCE(priv->irq_enabled[offset], true);
 	WRITE_ONCE(priv->irq_last_value_valid[offset], false);
 
+	wake_up(&priv->irq_poll_wq);
+
 	return priv->irq_base + offset;
 }
 
 #ifdef CONFIG_GPIOLIB_IRQCHIP
 #define FTDI_IRQ_POLL_PERIOD_US_DEFAULT	1000U
 #define FTDI_IRQ_POLL_MIN_US		1000U	/* a GPIO read costs ~1 ms of USB */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0)
+/*
+ * wait_event_idle() landed in 4.13; TASK_IDLE itself has existed since 4.2.
+ * Mirrors the upstream definition so behaviour matches on older trees.
+ */
+#define wait_event_idle(wq_head, condition)				\
+do {									\
+	might_sleep();							\
+	if (!(condition))						\
+		___wait_event(wq_head, condition, TASK_IDLE, 0, 0,	\
+			      schedule());				\
+} while (0)
+#endif
 
 static void ftdi_mpsse_dispatch_irq(struct ft232h_intf_priv *priv,
 					    unsigned int offset)
@@ -3476,6 +3500,37 @@ static int ftdi_irq_poll_function(void *argument)
 	while (!kthread_should_stop()) {
 		s64 wait_ns;
 		u64 now_ns;
+
+		/*
+		 * With no line events requested there is nothing to sample, so
+		 * park rather than wake at the poll rate only to find the same
+		 * empty mask. An idle interface otherwise costs ~1.5% of a core
+		 * for no work at all, and because the poll loop sleeps
+		 * uninterruptibly it also pins a permanent +1 on the load
+		 * average -- which matters on hosts running a watchdog that
+		 * reboots on a load threshold.
+		 *
+		 * wait_event_idle() rather than _interruptible(): TASK_IDLE is
+		 * TASK_UNINTERRUPTIBLE | TASK_NOLOAD, so a parked thread stays
+		 * out of the load average without exposing an -ERESTARTSYS path
+		 * that could spin the loop. kthread_should_stop() is part of the
+		 * wait condition so disconnect can still tear us down, and the
+		 * enable paths wake us through the same queue.
+		 */
+		if (!ftdi_irq_lines_enabled(priv, NULL, NULL)) {
+			wait_event_idle(priv->irq_poll_wq,
+					ftdi_irq_lines_enabled(priv, NULL, NULL) ||
+					kthread_should_stop());
+			if (kthread_should_stop())
+				break;
+
+			/*
+			 * Time spent parked is not a missed poll deadline, so
+			 * restart the interval instead of reporting the gap.
+			 */
+			priv->irq_last_poll_ns = 0;
+			next_poll_ns = ktime_get_boottime_ns();
+		}
 
 		next_poll_ns += period_ns;
 
