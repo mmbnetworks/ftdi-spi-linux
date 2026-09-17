@@ -3376,6 +3376,22 @@ static int ftdi_mpsse_gpio_check_locked(struct ft232h_intf_priv *priv)
 				    "check irq: offset %u, val %d, changed %d\n",
 				    offset, gpio_val, changed);
 
+		/*
+		 * The edge types are deliberately evaluated against the sampled
+		 * level rather than against 'changed', which makes them behave as
+		 * level-sensitive triggers. That is not an oversight: the line is
+		 * sampled over USB at irq_poll_period (1 ms by default), so any
+		 * pulse shorter than the poll interval has no observable edge at
+		 * all, and a consumer waiting for one would stall forever. Re-
+		 * notifying while the line is asserted is what makes a missed edge
+		 * self-correcting.
+		 *
+		 * Measured: requiring a transition here makes cpcd's connect to the
+		 * Wi-SUN radio intermittently stall -- 1.4 s and no retries across
+		 * six restarts became 5-29 s with up to 14 retries, and one attempt
+		 * never connected. Do not 'fix' this without replacing the polled
+		 * sampler with something that cannot miss an edge.
+		 */
 		switch (type) {
 		case IRQ_TYPE_EDGE_RISING:
 			if (!gpio_val)
