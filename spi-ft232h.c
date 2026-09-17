@@ -1772,6 +1772,8 @@ static int ftdi_mpsse_init(struct ftdi_spi *priv)
 
 static int ftdi_mpsse_gpio_probe(struct usb_interface *intf);
 static int ftdi_mpsse_irq_probe(struct usb_interface *intf);
+static void ftdi_mpsse_gpio_remove(struct usb_interface *intf);
+static void ftdi_mpsse_gpio_thread_stop(struct ft232h_intf_priv *priv);
 
 static int ftdi_spi_probe(struct platform_device *pdev)
 {
@@ -2009,13 +2011,24 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 
 	ret = ftdi_mpsse_gpio_probe(priv->intf);
 	if (ret < 0)
-		goto err;
+		goto err_gpio;
 
 	ret = ftdi_mpsse_irq_probe(priv->intf);
 	if (ret < 0)
-		goto err;
+		goto err_gpio;
 
 	return 0;
+
+err_gpio:
+	/*
+	 * ftdi_mpsse_gpio_probe() may have started the poll thread and has
+	 * certainly registered the GPIO lookup table globally. Neither is
+	 * undone by unregistering the controller, so without this the table
+	 * outlives its devm storage and the thread keeps touching priv after
+	 * a failed probe.
+	 */
+	ftdi_mpsse_gpio_thread_stop(usb_get_intfdata(priv->intf));
+	ftdi_mpsse_gpio_remove(priv->intf);
 err:
 	platform_set_drvdata(pdev, NULL);
 	ftdi_spi_pipeline_teardown(priv);
@@ -2036,6 +2049,21 @@ static void ftdi_mpsse_irq_remove(struct usb_interface *intf)
 
 	if (priv->irq_base >= 0)
 		irq_free_descs(priv->irq_base, chip->ngpio);
+}
+
+static void ftdi_mpsse_gpio_thread_stop(struct ft232h_intf_priv *priv)
+{
+	if (!priv || !priv->gpio_thread)
+		return;
+
+	/*
+	 * kthread_stop() already wakes the thread and waits for it to exit,
+	 * and it drops the reference taken by kthread_run(), so the task must
+	 * not be touched afterwards.
+	 */
+	kthread_stop(priv->gpio_thread);
+	wait_for_completion(&priv->gpio_thread_complete);
+	priv->gpio_thread = NULL;
 }
 
 static void ftdi_mpsse_gpio_remove(struct usb_interface *intf)
@@ -3612,11 +3640,7 @@ static void ft232h_intf_disconnect(struct usb_interface *intf)
 	struct ft232h_intf_priv *priv = usb_get_intfdata(intf);
 	const struct ft232h_intf_info *info;
 
-	if(priv->gpio_thread){
-		kthread_stop(priv->gpio_thread);
-		wake_up_process (priv->gpio_thread);
-		wait_for_completion(&priv->gpio_thread_complete);
-	}
+	ftdi_mpsse_gpio_thread_stop(priv);
 
 	ftdi_mpsse_irq_remove(intf);
         ftdi_mpsse_gpio_remove(intf);
