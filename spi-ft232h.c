@@ -2480,14 +2480,22 @@ static int ftdi_mpsse_get_port_pins(struct ft232h_intf_priv *priv, bool low)
 	int recover_try;
 	u8 rxbuf[4];
 
-	if (low)
-		priv->tx_buf[0] = GET_BITS_LOW;
-	else
-		priv->tx_buf[0] = GET_BITS_HIGH;
-	/* Force immediate response for GET_BITS to avoid latency timer stalls. */
-	priv->tx_buf[1] = SEND_IMMEDIATE;
-
 	for (recover_try = 0; recover_try < 2; recover_try++) {
+		/*
+		 * Build the command inside the loop. ftdi_mpsse_recover_channel()
+		 * below reuses priv->tx_buf for DIS_ADAPTIVE/DIS_3_PHASE and then
+		 * for SET_BITS_LOW/HIGH, so by the time we retry it no longer holds
+		 * a read command. Retrying with those stale bytes sends a write
+		 * where a GET_BITS is expected, the read times out again, and the
+		 * recovery path can never succeed.
+		 */
+		if (low)
+			priv->tx_buf[0] = GET_BITS_LOW;
+		else
+			priv->tx_buf[0] = GET_BITS_HIGH;
+		/* Force immediate response for GET_BITS to avoid latency timer stalls. */
+		priv->tx_buf[1] = SEND_IMMEDIATE;
+
 		ret = ftdi_write_data(priv->intf, priv->tx_buf, 2);
 		if (ret < 0) {
 			dev_dbg_ratelimited(dev, "Writing port pins cmd failed: %d\n",
