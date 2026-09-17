@@ -2864,22 +2864,34 @@ static struct platform_device *mpsse_dev_register(struct ft232h_intf_priv *priv,
 
 	ret = platform_device_add_data(pdev, pd, sizeof(*pd));
 	if (ret)
-		goto err;
+		goto err_put;
 	pdev->id = priv->id;
 
 	ret = platform_device_add(pdev);
 	if (ret < 0)
-		goto err;
+		goto err_put;
 
 	dev_dbg(&pdev->dev, "%s done\n", __func__);
 
 	ret = ftdi_spi_probe(pdev);
 	if (ret < 0)
-		goto err;
+		goto err_unregister;
 
 	return pdev;
 
-err:
+err_unregister:
+	/*
+	 * platform_device_add() succeeded, so the device is live on the
+	 * platform bus. Dropping only our reference would leave it registered
+	 * with no driver: the name stays taken, every later probe fails with
+	 * -EEXIST, and nothing short of a reboot clears it.
+	 */
+	priv->spi_pdev = NULL;
+	platform_device_unregister(pdev);
+	return ERR_PTR(ret);
+
+err_put:
+	priv->spi_pdev = NULL;
 	platform_device_put(pdev);
 	return ERR_PTR(ret);
 }
