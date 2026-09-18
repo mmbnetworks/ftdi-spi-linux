@@ -1,3 +1,18 @@
+ftdi-spi-linux (1.5) UNRELEASED; urgency=medium
+
+  * Park the GPIO IRQ poll thread while no GPIO line events are requested,
+    so an interface with no IRQ consumers stops polling USB at 1 kHz and
+    stays out of the load average.
+  * Allocate the USB transfer buffers from ZONE_DMA. The BCM2711 dwc2
+    controller only reaches the low 1 GiB of RAM, so buffers outside that
+    window were bounced through SWIOTLB on every transfer.
+  * Unregister the SPI platform device when probe fails after it has been
+    added, instead of only dropping a reference. A leaked device kept the
+    name registered and made every later probe fail with -EEXIST until the
+    machine was rebooted.
+
+ -- David Smith <mmb-davidsmith@users.noreply.github.com>  Thu, 17 Sep 2026 16:07:10 +0000
+
 ftdi-spi-linux (1.4) UNRELEASED; urgency=medium
 
   * Initial release.
