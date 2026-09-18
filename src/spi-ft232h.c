@@ -2945,14 +2945,6 @@ static const struct ft232h_intf_info ft232h_spi_cfg_intf_info = {
 	.plat_data  = &ft232h_spi_cfg_plat_data,
 };
 
-static void ftdi_free_dma_bufs(struct ft232h_intf_priv *priv)
-{
-	kfree(priv->bulk_in_buf);
-	priv->bulk_in_buf = NULL;
-	kfree(priv->tx_buf);
-	priv->tx_buf = NULL;
-}
-
 static int ft232h_intf_probe(struct usb_interface *intf,
 			     const struct usb_device_id *id)
 {
@@ -3036,16 +3028,24 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 	 * buffer with dma_map_single(), which rejects vmalloc addresses.
 	 * ZONE_DMA memory is linear-mapped, so it maps directly with no
 	 * bounce and stays usable with usb_bulk_msg().
+	 *
+	 * devm rather than plain kmalloc(): GPIO callbacks check priv->intf
+	 * under io_mutex and then drop it before taking ops_mutex and touching
+	 * tx_buf, so a caller that has already passed that check can still be
+	 * writing the buffer while disconnect runs. Letting devm release these
+	 * after unbind keeps them alive for those callers, and frees them on a
+	 * failed probe without an unwind path. devm_kmalloc() passes gfp
+	 * straight through, and its data[] is ARCH_DMA_MINALIGN-aligned.
 	 */
-	priv->bulk_in_buf = kmalloc(priv->bulk_in_sz, GFP_KERNEL | GFP_DMA);
+	priv->bulk_in_buf = devm_kmalloc(dev, priv->bulk_in_sz,
+					 GFP_KERNEL | GFP_DMA);
 	if (!priv->bulk_in_buf) {
 		usb_put_dev(priv->udev);
 		return -ENOMEM;
 	}
 
-	priv->tx_buf = kmalloc(FTDI_TX_BUF_SZ, GFP_KERNEL | GFP_DMA);
+	priv->tx_buf = devm_kmalloc(dev, FTDI_TX_BUF_SZ, GFP_KERNEL | GFP_DMA);
 	if (!priv->tx_buf) {
-		ftdi_free_dma_bufs(priv);
 		usb_put_dev(priv->udev);
 		return -ENOMEM;
 	}
@@ -3055,7 +3055,6 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 
 	priv->id = ida_simple_get(&ftdi_devid_ida, 0, 0, GFP_KERNEL);
 	if (priv->id < 0) {
-		ftdi_free_dma_bufs(priv);
 		usb_put_dev(priv->udev);
 		return priv->id;
 	}
@@ -3070,6 +3069,7 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 	return 0;
 err:
 	ida_simple_remove(&ftdi_devid_ida, priv->id);
+	usb_put_dev(priv->udev);
 	return ret;
 }
 
@@ -3781,7 +3781,6 @@ static void ft232h_intf_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(intf, NULL);
 	mutex_unlock(&priv->io_mutex);
 
-	ftdi_free_dma_bufs(priv);
 	usb_put_dev(priv->udev);
 	ida_simple_remove(&ftdi_devid_ida, priv->id);
 
