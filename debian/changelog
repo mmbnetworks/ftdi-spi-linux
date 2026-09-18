@@ -1,0 +1,5 @@
+ftdi-spi-linux (1.4) UNRELEASED; urgency=medium
+
+  * Initial release.
+
+ -- David Smith <mmb-davidsmith@users.noreply.github.com>  Wed, 16 Sep 2026 13:35:56 +0000

@@ -1,0 +1,28 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ftdi-spi-linux
+Upstream-Contact: MMB Networks <support@mmbnetworks.com>
+Source: https://github.com/mmbnetworks/ftdi-spi-linux
+
+Files: *
+Copyright:
+ Copyright (C) James Ewing <james@teledatics.com>
+ Copyright (C) Yuji Sasaki <sasaki@silexamerica.com>
+ Copyright (C) Anatolij Gustschin <agust@denx.de>
+License: GPL-2
+
+Files: debian/*
+Copyright: Copyright (C) MMB Networks <support@mmbnetworks.com>
+License: GPL-2
+
+License: GPL-2
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License version 2 as
+ published by the Free Software Foundation.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in "/usr/share/common-licenses/GPL-2".

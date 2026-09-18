@@ -34,18 +34,143 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential linux-headers-generic
+            build-essential zstd linux-headers-generic
 
+      # sort -V, not `tail -1` on ls output: lexically 6.8.0-9-generic sorts
+      # after 6.8.0-84-generic, so a plain tail picks the older ABI whenever two
+      # header trees are installed.
       - name: Build module
-        run: make KDIR=/usr/src/$(ls /usr/src | grep generic | tail -1)
+        run: |
+          set -euo pipefail
+          KVER=$(ls -1 /usr/src \
+                 | sed -n 's/^linux-headers-\(.*-generic\)$/\1/p' \
+                 | sort -V | tail -1)
+          [ -n "$KVER" ] || { echo "no linux-headers-*-generic found"; exit 1; }
+          echo "Building against $KVER"
+          make -C src KDIR="/usr/src/linux-headers-$KVER"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: spi-ft232h-ubuntu-${{ matrix.arch }}
           path: |
-            spi-ft232h.ko
-            spi-ft232h.ko.zst
+            src/spi-ft232h.ko
+            src/spi-ft232h.ko.zst
+
+  # ---------------------------------------------------------------
+  # DKMS package build
+  # ---------------------------------------------------------------
+  dkms:
+    name: DKMS Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          path: ftdi-spi-linux
+
+      - name: Install dkms build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential debhelper dh-dkms dkms
+
+      - name: Build package
+        run: cd ftdi-spi-linux && dpkg-buildpackage -us -uc -b
+
+      # Building the .deb only proves the packaging is well-formed. Compiling it
+      # is what exercises dkms.conf and catches a wrong BUILT_MODULE_NAME.
+      #
+      # Build against linux-headers-generic rather than the runner's own kernel:
+      # GitHub runners boot an Azure kernel whose matching linux-headers package
+      # is not reliably in the archive. Absent headers are NOT fatal to dkms --
+      # common.postinst skips that kernel and exits 0 -- so the explicit
+      # build/install below is what guarantees a compile actually happened.
+      #
+      # Kept as separate steps so a failure is attributable from the job summary
+      # without having to open the log.
+      - name: Install generic kernel headers
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends linux-headers-generic
+          echo "runner kernel: $(uname -r)"
+          echo "--- /usr/src ---";     ls -1 /usr/src
+          echo "--- /lib/modules ---"; ls -1 /lib/modules
+
+      - name: Resolve target kernel
+        id: kver
+        run: |
+          set -euo pipefail
+          KVER=$(ls -1 /usr/src \
+                 | sed -n 's/^linux-headers-\(.*-generic\)$/\1/p' \
+                 | sort -V | tail -1)
+          if [ -z "$KVER" ]; then
+            echo "::error::no linux-headers-*-generic under /usr/src"; exit 1
+          fi
+          if [ ! -d "/lib/modules/$KVER/build" ]; then
+            echo "::error::/lib/modules/$KVER/build is missing"
+            ls -la "/lib/modules/$KVER" || true
+            exit 1
+          fi
+          echo "target kernel: $KVER"
+          echo "kver=$KVER" >> "$GITHUB_OUTPUT"
+
+      # Suppress autoinstall for the duration of dpkg. The postinst otherwise
+      # builds against the runner's own Azure kernel, which is far newer than
+      # anything this driver currently compiles against (no_llseek, and
+      # ida_simple_get/ida_simple_remove are gone; gpio_chip->set returns int)
+      # and is not a target platform. The explicit build in the next step
+      # covers the kernel we actually care about.
+      - name: Install DKMS package
+        run: |
+          set -euo pipefail
+          ls -la ftdi-spi-linux_*_all.deb
+          sudo mkdir -p /etc/dkms && sudo touch /etc/dkms/no-autoinstall
+          sudo dpkg -i ftdi-spi-linux_*_all.deb
+          sudo rm -f /etc/dkms/no-autoinstall
+          # no-autoinstall makes common.postinst return before `dkms add`, so
+          # register the module explicitly.
+          VER=$(ls -d /usr/src/ftdi-spi-linux-* | sed 's|.*/ftdi-spi-linux-||')
+          sudo dkms add -m ftdi-spi-linux -v "$VER"
+          dkms status
+
+      - name: Build module via DKMS
+        run: |
+          set -euo pipefail
+          KVER='${{ steps.kver.outputs.kver }}'
+          VER=$(ls -d /usr/src/ftdi-spi-linux-* | sed 's|.*/ftdi-spi-linux-||')
+          echo "module version: $VER"
+          sudo dkms build   -m ftdi-spi-linux -v "$VER" -k "$KVER"
+          sudo dkms install -m ftdi-spi-linux -v "$VER" -k "$KVER"
+
+      - name: Verify module installed
+        run: |
+          set -euo pipefail
+          KVER='${{ steps.kver.outputs.kver }}'
+          # Capture first rather than `... | tee /dev/stderr | grep -q`: grep -q
+          # exits on the first match and can SIGPIPE tee, which pipefail then
+          # turns into a spurious failure.
+          status=$(dkms status -m ftdi-spi-linux -k "$KVER")
+          echo "$status"
+          echo "$status" | grep -q ': installed'
+          ko=$(ls -1 /lib/modules/"$KVER"/updates/dkms/spi-ft232h.ko* | head -1)
+          echo "installed module: $ko"
+          modinfo "$ko"
+
+      - name: DKMS build log (on failure)
+        if: failure()
+        run: |
+          for f in /var/lib/dkms/ftdi-spi-linux/*/build/make.log; do
+            [ -f "$f" ] && { echo "===== $f ====="; cat "$f"; }
+          done
+          sudo dkms status || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ftdi-spi-linux
+          path: ftdi-spi-linux_*_all.deb
+
 
   # ---------------------------------------------------------------
   # Cross-compile for Raspberry Pi against the official RPi kernel
@@ -81,7 +206,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential bc flex bison libssl-dev libelf-dev \
+            build-essential zstd bc flex bison libssl-dev libelf-dev \
             ${{ matrix.cross_pkg }}
 
       - name: Cache Raspberry Pi kernel source
@@ -89,7 +214,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.RPI_LINUX }}
-          key: rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-${{ hashFiles('spi-ft232h.c') }}
+          key: rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-${{ hashFiles('src/spi-ft232h.c') }}
           restore-keys: |
             rpi-linux-${{ matrix.arch }}-${{ matrix.defconfig }}-
             rpi-linux-${{ matrix.arch }}-
@@ -113,7 +238,7 @@ jobs:
 
       - name: Build module
         run: |
-          make \
+          make -C src \
             ARCH=${{ matrix.arch }} \
             CROSS_COMPILE=${{ matrix.cross_compile }} \
             KBUILD_MODPOST_WARN=1 \
@@ -124,5 +249,5 @@ jobs:
         with:
           name: spi-ft232h-${{ matrix.artifact }}
           path: |
-            spi-ft232h.ko
-            spi-ft232h.ko.zst
+            src/spi-ft232h.ko
+            src/spi-ft232h.ko.zst

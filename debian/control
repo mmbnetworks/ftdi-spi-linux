@@ -1,0 +1,19 @@
+Source: ftdi-spi-linux
+Section: kernel
+Priority: optional
+Maintainer: MMB Networks <support@mmbnetworks.com>
+Rules-Requires-Root: no
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-dkms,
+Standards-Version: 4.6.2
+Homepage: https://github.com/mmbnetworks/ftdi-spi-linux/tree/cpcd
+
+Package: ftdi-spi-linux
+Architecture: all
+Multi-Arch: foreign
+Depends:
+ ${misc:Depends},
+Description: FTDI SPI Driver
+ This package contains the driver for the FT2232H operating in SPI mode with
+ GPIO control. It uses DKMS to automatically build the kernel module.
