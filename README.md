@@ -19,6 +19,9 @@ Load-time parameters allow the data path to be tuned per target. Parameters are 
 | `rx_retry_us` | `0` | Optional sleep between empty USB reads. Setting `25`–`75` reduces CPU burn during long bursts. |
 | `enable_stats` | `1` | Enable debugfs statistics collection (see below). |
 | `pipeline_depth` | profile | Number of concurrent bulk-IN URBs. If left at `0`, the driver picks based on profile (legacy:1, balanced:2, aggressive:4). |
+| `irq_poll_period` | `1000` | Base GPIO poll period in microseconds. Clamped to a 1000 us floor. |
+| `irq_poll_max_us` | `10000` | Deadline budget for maximum time between GPIO polls when strict mode is enabled. |
+| `irq_poll_strict` | `1` | Enables deadline reporting, latency-biased SPI chunk sizing, and MPSSE lock release between chunks. |
 
 The legacy behaviour (profile `0`) matches earlier releases. Profiles `1` and `2` raise internal burst sizes and buffer allocations without requiring explicit `max_block`/`bulk_in_buf_kb` overrides.
 
@@ -35,6 +38,28 @@ Use module parameters to switch between predictable legacy behaviour and high-th
   ```
 
 The aggressive preset expects a stable HS USB link and enables statistics by default so that tuning can be verified. When left at the default settings the driver collects runtime metrics and may automatically scale back zero-copy TX or pipeline depth if the host link indicates repeated stalls.
+
+## GPIO IRQ latency controls
+
+When GPIO line IRQs are active, the driver uses a strict periodic polling thread with a microsecond cadence and deadline tracking.
+
+For latency-focused workloads, keep strict mode enabled and tune:
+
+```bash
+modprobe spi-ft232h irq_poll_strict=1 irq_poll_period=1000 irq_poll_max_us=10000
+```
+
+When IRQ lines are enabled the driver clamps per-chunk SPI payloads to half the
+deadline budget and releases the MPSSE lock between chunks, so the poll thread
+can run mid-transfer. The clamp has a 64-byte floor, so the budget cannot be met
+below roughly 100 kHz. A poll that overruns `irq_poll_max_us` is reported with a
+rate-limited `GPIO poll gap ... exceeds ... budget` warning.
+
+A single GPIO read costs about 1 ms of USB round-trip, which sets the floor on
+both knobs. Measured poll gaps are ~1000 us for any `irq_poll_period` of 200,
+500 or 1000 us at identical CPU cost, so the period is clamped to 1000 us;
+2000 us yields a 2004 us gap at half the CPU. Budgets near 2000 us are not
+achievable on this hardware and log continuously.
 
 Full-duplex messages now share the same zero-copy fast path that previously applied only to TX-only workloads. Transfers using 8-bit words and >=4 KiB bursts avoid an extra memcpy, and the chunk-level stats exported via debugfs capture both TX-only and duplex pipelines so that adaptive autotuning decisions are visible in a single set of counters.
 

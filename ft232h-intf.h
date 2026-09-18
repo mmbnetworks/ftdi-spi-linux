@@ -125,6 +125,11 @@ struct ft232h_intf_ops {
 			    u8 value_bits);
 	int (*set_clock)(struct usb_interface *intf, int clock_freq_hz);
 	int (*set_latency)(struct usb_interface *intf, int latency_msec);
+	/*
+	 * Counter bumped whenever the MPSSE is re-initialised underneath the
+	 * SPI controller, invalidating its cached clock and mode.
+	 */
+	u32 (*get_mpsse_epoch)(struct usb_interface *intf);
 
 	int (*gpio_get)(struct usb_interface *intf, unsigned int offset);
 	void (*gpio_set)(struct usb_interface *intf, unsigned int offset, int value);
